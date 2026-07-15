@@ -1,6 +1,6 @@
-// create a mock engine python object for testing purposes
-use pyo3::prelude::*;
 use crate::core;
+
+use pyo3::prelude::*;
 
 #[pyclass(name = "Engine")]
 pub struct PyEngine {

@@ -1,6 +1,7 @@
-mod zobrist;
 mod movegen;
+mod zobrist;
 
+use crate::core::bitboard::Bitboard;
 use crate::core::utils;
 pub use movegen::Move;
 use zobrist::ZOBRIST;
@@ -25,8 +26,8 @@ pub enum PieceType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
-    colors: [u64; 2], // indexed by Color
-    pieces: [u64; 6], // indexed by PieceType
+    colors: [Bitboard; 2], // indexed by Color
+    pieces: [Bitboard; 6], // indexed by PieceType
     zobrist: u64,
     active_color: Color,
     en_passant_file: Option<u8>,
@@ -40,8 +41,8 @@ impl Board {
 
     pub fn from_fen(fen: &str) -> Result<Self, String> {
         let mut board = Self {
-            colors: [0; 2],
-            pieces: [0; 6],
+            colors: [Bitboard::EMPTY; 2],
+            pieces: [Bitboard::EMPTY; 6],
             zobrist: 0,
             active_color: Color::White,
             en_passant_file: None,
@@ -134,7 +135,7 @@ impl Board {
     }
 
     pub fn piece_at(&self, square: usize) -> Option<(PieceType, Color)> {
-        let bit = 1u64 << square;
+        let bit = Bitboard::from_square(square);
         for piece_type in [
             PieceType::Pawn,
             PieceType::Knight,
@@ -143,8 +144,8 @@ impl Board {
             PieceType::Queen,
             PieceType::King,
         ] {
-            if self.pieces[piece_type as usize] & bit != 0 {
-                let color = if self.colors[Color::Black as usize] & bit != 0 {
+            if self.pieces[piece_type as usize] & bit != Bitboard::EMPTY {
+                let color = if self.colors[Color::Black as usize] & bit != Bitboard::EMPTY {
                     Color::Black
                 } else {
                     Color::White
@@ -179,7 +180,7 @@ impl Board {
 
     /// unsafe: assumes from empty state
     fn put_piece(&mut self, piece_type: PieceType, color: Color, square: usize) {
-        let bit = 1u64 << square;
+        let bit = Bitboard::from_square(square);
         self.pieces[piece_type as usize] |= bit;
         self.colors[color as usize] |= bit;
         self.zobrist ^= ZOBRIST.piece_square(piece_type, color, square);

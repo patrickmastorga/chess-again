@@ -1,6 +1,6 @@
+mod bitboard;
 mod board;
 mod utils;
-mod bitboard;
-    
-pub use board::{Color, PieceType, Board, Move};
-pub use bitboard::BitboardExt;
+
+pub use bitboard::{BitIndexIter, BitIter, Bitboard};
+pub use board::{Board, Color, Move, PieceType};

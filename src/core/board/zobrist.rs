@@ -8,23 +8,28 @@ pub struct Zobrist {
 }
 
 impl Zobrist {
+    #[inline]
     pub fn piece_square(&self, piece_type: PieceType, color: Color, square: usize) -> u64 {
         let piece = (color as usize) * 6 + (piece_type as usize);
         self.pieces[(piece << 6) | square]
     }
 
+    #[inline]
     pub fn color(&self) -> u64 {
         self.color
     }
 
+    #[inline]
     pub fn kingside_castling(&self, color: Color) -> u64 {
         self.castling[color as usize]
     }
 
+    #[inline]
     pub fn queenside_castling(&self, color: Color) -> u64 {
         self.castling[color as usize + 2]
     }
 
+    #[inline]
     pub fn en_passant(&self, file: usize) -> u64 {
         self.en_passant[file]
     }

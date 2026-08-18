@@ -1,3 +1,4 @@
-pub mod board;
+mod board;
+mod utils;
 
-pub use board::Board;
+pub use board::{Color, PieceType, Board, Move};

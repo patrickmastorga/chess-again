@@ -1,4 +1,4 @@
-use super::{PieceType, Color};
+use super::{Color, PieceType};
 
 pub struct Zobrist {
     pieces: [u64; 12 * 64],
@@ -9,7 +9,7 @@ pub struct Zobrist {
 
 impl Zobrist {
     pub fn piece_square(&self, piece_type: PieceType, color: Color, square: usize) -> u64 {
-        let piece = (color as usize * 6) + piece_type as usize;
+        let piece = (color as usize) * 6 + (piece_type as usize);
         self.pieces[(piece << 6) | square]
     }
 
@@ -30,5 +30,5 @@ impl Zobrist {
     }
 }
 
-// read the zobrist hashing constants generated at build time
+// define static zobrist struct containing constants generated at build time
 include!(concat!(env!("OUT_DIR"), "/zobrist.rs"));

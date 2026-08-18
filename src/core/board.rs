@@ -130,7 +130,6 @@ impl Board {
         }
 
         // halfmove and fullmove clocks ignored by board type
-
         Ok(board)
     }
 

@@ -1,10 +1,11 @@
 mod movegen;
 mod zobrist;
 
-use crate::core::bitboard::Bitboard;
+pub use self::movegen::Move;
+
+use self::zobrist::ZOBRIST;
+use crate::core::Bitboard;
 use crate::core::utils;
-pub use movegen::Move;
-use zobrist::ZOBRIST;
 
 /// The two chess colors, with values matching array indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,13 +25,14 @@ pub enum PieceType {
     King = 5,
 }
 
+/// Represents an individual chess board state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Board {
     colors: [Bitboard; 2], // indexed by Color
     pieces: [Bitboard; 6], // indexed by PieceType
     zobrist: u64,
     active_color: Color,
-    en_passant_file: Option<u8>,
+    en_passant_square: Option<u8>,
     castling_rights: u8,
 }
 
@@ -45,7 +47,7 @@ impl Board {
             pieces: [Bitboard::EMPTY; 6],
             zobrist: 0,
             active_color: Color::White,
-            en_passant_file: None,
+            en_passant_square: None,
             castling_rights: 0,
         };
 
@@ -127,11 +129,85 @@ impl Board {
                     en_passant
                 ));
             };
-            board.put_en_passant(square & 0b111);
+            board.put_en_passant(square);
         }
 
         // halfmove and fullmove clocks ignored by board type
         Ok(board)
+    }
+
+    pub fn as_fen(&self) -> String {
+        let mut fen = String::new();
+        for rank in (0..8).rev() {
+            let mut empty_count = 0;
+            for file in 0..8 {
+                let square = rank * 8 + file;
+                match self.piece_at(square) {
+                    Some((piece_type, color)) => {
+                        if empty_count > 0 {
+                            fen.push_str(&empty_count.to_string());
+                            empty_count = 0;
+                        }
+                        let c = match piece_type {
+                            PieceType::Pawn => 'p',
+                            PieceType::Knight => 'n',
+                            PieceType::Bishop => 'b',
+                            PieceType::Rook => 'r',
+                            PieceType::Queen => 'q',
+                            PieceType::King => 'k',
+                        };
+                        fen.push(if color == Color::White {
+                            c.to_ascii_uppercase()
+                        } else {
+                            c
+                        });
+                    }
+                    None => {
+                        empty_count += 1;
+                    }
+                }
+            }
+            if empty_count > 0 {
+                fen.push_str(&empty_count.to_string());
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
+        }
+        fen.push(' ');
+        fen.push(if self.active_color == Color::White {
+            'w'
+        } else {
+            'b'
+        });
+        fen.push(' ');
+        if self.castling_rights == 0 {
+            fen.push('-');
+        } else {
+            if self.can_kingside_castle(Color::White) {
+                fen.push('K');
+            }
+            if self.can_queenside_castle(Color::White) {
+                fen.push('Q');
+            }
+            if self.can_kingside_castle(Color::Black) {
+                fen.push('k');
+            }
+            if self.can_queenside_castle(Color::Black) {
+                fen.push('q');
+            }
+        }
+        fen.push(' ');
+        match self.en_passant_square {
+            Some(square) => {
+                fen.push_str(&utils::square_to_algebraic(square as usize));
+            }
+            None => {
+                fen.push('-');
+            }
+        }
+        fen.push_str(" 0 1"); // halfmove and fullmove clocks
+        fen
     }
 
     pub fn piece_at(&self, square: usize) -> Option<(PieceType, Color)> {
@@ -207,15 +283,16 @@ impl Board {
     }
 
     /// unsafe: assumes from empty state
-    fn put_en_passant(&mut self, file: usize) {
-        self.en_passant_file = Some(file as u8);
-        self.zobrist ^= ZOBRIST.en_passant(file);
+    fn put_en_passant(&mut self, square: usize) {
+        self.en_passant_square = Some(square as u8);
+        self.zobrist ^= ZOBRIST.en_passant(square);
     }
 }
 
 /// Stockfish-style board representation
 impl std::fmt::Display for Board {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Board: {}\n", self.as_fen())?;
         for rank in (0..8).rev() {
             write!(f, " +---+---+---+---+---+---+---+---+\n")?;
             for file in 0..8 {

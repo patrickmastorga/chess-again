@@ -1,11 +1,8 @@
-use chess_again::core::BITBOARDS;
 use chess_again::core::Board;
 
 fn main() {
-    let board = Board::new();
-    println!("{}", board);
-
-    println!("{}", BITBOARDS.white_pawn_attacks[12]);
-
-    println!("{}", BITBOARDS.northwest_ray[12]);
+    let mut board =
+        Board::from_fen("rnbqkb1r/ppppp1pp/7n/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3").unwrap();
+    let nodes = board.perft(1);
+    println!("{nodes} nodes");
 }

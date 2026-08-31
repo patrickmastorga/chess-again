@@ -1,6 +1,9 @@
 mod bitboard;
 mod board;
-mod utils;
+mod fen;
+mod movegen;
+pub mod utils;
 
-pub use self::bitboard::{BitIndexIter, BitIter, Bitboard, BITBOARDS};
-pub use self::board::{Board, Color, Move, PieceType};
+pub use self::bitboard::{BitIndexIter, BitIter, Bitboard};
+pub use self::board::{Board, CastlingRights, Color, Move, MoveType, PieceType};
+pub use self::movegen::MoveSink;

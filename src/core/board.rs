@@ -355,6 +355,44 @@ impl Board {
             >= 3
     }
 
+    pub fn is_insufficient_material(&self) -> bool {
+        // Any pawn, rook, or queen means that a checkmate is possible.
+        if !(self.pawns(Color::White) | self.pawns(Color::Black)).is_empty()
+            || !(self.rooks(Color::White) | self.rooks(Color::Black)).is_empty()
+            || !(self.queens(Color::White) | self.queens(Color::Black)).is_empty()
+        {
+            return false;
+        }
+
+        let white_knights = self.knights(Color::White).count();
+        let black_knights = self.knights(Color::Black).count();
+        let total_knights = white_knights + black_knights;
+        let total_bishops = self.bishops(Color::White).count() + self.bishops(Color::Black).count();
+
+        // Two knights can provide mating material, as can a knight against
+        // any other minor piece (including another knight).
+        if total_knights >= 2 || (total_knights > 0 && total_bishops > 0) {
+            return false;
+        }
+
+        if total_bishops == 0 {
+            // King versus king, or king and one knight versus king.
+            return true;
+        }
+
+        // Bishops can mate only when bishops of both square colours are
+        // present. Square 0 is a dark square with this board's indexing.
+        let bishops = self.bishops(Color::White) | self.bishops(Color::Black);
+        let has_dark_square_bishop = bishops
+            .iter_indices()
+            .any(|square| (square / 8 + square % 8) % 2 == 0);
+        let has_light_square_bishop = bishops
+            .iter_indices()
+            .any(|square| (square / 8 + square % 8) % 2 != 0);
+
+        !(has_dark_square_bishop && has_light_square_bishop)
+    }
+
     pub fn all_pieces(&self) -> Bitboard {
         self.colors[0] | self.colors[1]
     }

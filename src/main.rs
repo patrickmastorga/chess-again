@@ -1,8 +1,18 @@
-use chess_again::core::Board;
+use chess_again::core::Game;
+use rand::prelude::IndexedRandom;
 
 fn main() {
-    let mut board =
-        Board::from_fen("rnbqkb1r/ppppp1pp/7n/4Pp2/8/8/PPPP1PPP/RNBQKBNR w KQkq f6 0 3").unwrap();
-    let nodes = board.perft(1);
-    println!("{nodes} nodes");
+    let mut game =
+        Game::starting_at_fen("7k/8/1p6/8/8/P7/8/7K b - - 0 1").expect("starting fen is legal.");
+    let mut rng = rand::rng();
+
+    // play a random game to completion
+    while !game.legal_moves().is_empty() {
+        let mv = *game
+            .legal_moves()
+            .choose(&mut rng)
+            .expect("legal moves should not be empty.");
+        game.make_move(mv).expect("move should be legal.");
+    }
+    println!("Game:\n{}", game.to_pgn().expect("game is terminated."));
 }

@@ -57,13 +57,18 @@ impl Pins {
 }
 
 impl Board {
-    pub fn legal_moves(&mut self) -> Vec<Move> {
+    pub fn in_check(&self) -> bool {
+        let king_index = self.king_index(self.active_color());
+        self.is_attacked_ignore_king(king_index)
+    }
+
+    pub fn legal_moves(&self) -> Vec<Move> {
         let mut legal_moves = Vec::new();
         self.generate_legal_moves(&mut legal_moves);
         legal_moves
     }
 
-    pub fn is_legal_move(&mut self, mv: Move) -> bool {
+    pub fn is_legal_move(&self, mv: Move) -> bool {
         self.legal_moves().contains(&mv)
     }
 

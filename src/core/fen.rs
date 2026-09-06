@@ -92,8 +92,6 @@ impl Fen {
             Ok(_) => {}
         }
 
-        // HERE
-
         let fen = Fen {
             piece_placement,
             active_color,
@@ -163,16 +161,16 @@ impl Fen {
     pub fn en_passant(&self) -> Option<u8> {
         match self.en_passant.as_str() {
             "-" => None,
-            square => Some(utils::parse_algebraic(square).unwrap() as u8),
+            square => Some(utils::parse_algebraic(square).expect("En passant square validated above.") as u8),
         }
     }
 
     pub fn halfmove_clock(&self) -> u32 {
-        self.halfmove_clock.parse().unwrap()
+        self.halfmove_clock.parse().expect("Halfmove clock validated above.")
     }
 
     pub fn fullmove_number(&self) -> u32 {
-        self.fullmove_number.parse().unwrap()
+        self.fullmove_number.parse().expect("Fullmove number validated above.")
     }
 }
 

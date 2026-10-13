@@ -5,7 +5,7 @@ edition.workspace = true
 
 [dependencies]
 chess-again-core = { workspace = true }
-burn = { workspace = true, features = ["std", "flex", "fusion", "autotune", "store"] }
+burn = { workspace = true, features = ["std", "flex", "fusion", "autotune"] }
 
 [features]
 default = []

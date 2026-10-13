@@ -49,19 +49,23 @@
 // batch 512 (grad accumulation), 100-300k steps, lr 5e-4 with warmup, mixed precision, gradient clipping.
 // paper reference: 1.4M steps, batch 2048, single A100, ~4 days, lr 5e-4 constant, Nadam (b1=0.9, b2=0.98, eps=1e-7), clip 10, SWA checkpoints.
 
-// BACKEND RULES:
-// - ALL model/dataset code is backend-generic. Zero backend-specific
-//   imports, cfgs, or dtype assumptions outside ONE type-alias module
-//   driven by cargo features:
-//     default & tests:  burn-flex (CPU, eager, deterministic)
-//     training (M5):    feature "metal"   (CubeCL Metal compiler)
+// BACKEND RULES (Burn 0.22):
+// - Models and tensors carry NO backend type parameter. A runtime
+//   `Device` selects the backend, so all model/dataset code is written
+//   once. Zero backend-specific imports, cfgs, or dtype assumptions
+//   outside ONE device-constructor module driven by cargo features:
+//     default & tests:  flex   (CPU, pure Rust, eager, deterministic)
+//     training (M5):    feature "metal"   (Metal through WGPU, native MSL)
 //     later cluster:    feature "cuda"    (A100)
 //     later wasm ship:  "webgpu" + flex (inference only)
+// - Turn on autodiff on the DEVICE (`device.autodiff()`) before
+//   initializing the model or its inputs; there is no `Autodiff<B>`.
 // - Tests default to flex. MUST include one cross-backend integration
 //   test: identical weights -> flex vs metal forward, assert allclose
 //   (fp32 tolerance). This is the project's correctness harness.
 // - fp32 first. Half precision = later opt-in, never hardcoded.
-//   No deprecated backends (burn-ndarray, burn-candle, burn-tch).
+//   No deprecated backends. In 0.22 burn-ndarray and burn-tch (LibTorch)
+//   are deprecated and burn-candle is removed; use flex/cpu on CPU.
 // - Metal notes: #![recursion_limit = "256"] at crate root; fusion +
 //   autotune via feature flags; kernel tuning lives in cubecl.toml,
 //   never in code. First run on a new shape compiles/tunes kernels
@@ -83,7 +87,7 @@ use burn::module::Module;
 use burn::nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use burn::tensor::activation::{gelu, relu};
 use burn::tensor::module::attention;
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::{Device, Tensor};
 
 /// Side length of the board, i.e. squares per rank and file.
 pub const BOARD_SIZE: usize = 8;
@@ -119,18 +123,18 @@ pub struct GabHeadConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct GabHead<B: Backend> {
-    down: Linear<B>,
-    norm_mid: LayerNorm<B>,
-    up: Linear<B>,
-    norm_out: LayerNorm<B>,
+pub struct GabHead {
+    down: Linear,
+    norm_mid: LayerNorm,
+    up: Linear,
+    norm_out: LayerNorm,
     d_model: usize,
     n_heads: usize,
     template_width: usize,
 }
 
 impl GabHeadConfig {
-    fn init<B: Backend>(&self, device: &B::Device) -> GabHead<B> {
+    fn init(&self, device: &Device) -> GabHead {
         GabHead {
             down: LinearConfig::new(self.d_model, self.hidden_width).init(device),
             norm_mid: LayerNormConfig::new(self.hidden_width).init(device),
@@ -144,13 +148,13 @@ impl GabHeadConfig {
     }
 }
 
-impl<B: Backend> GabHead<B> {
+impl GabHead {
     /// Computes the per-head GAB template vectors from the attention input.
     ///
     /// # Shape
     /// - `tokens`: `[B, S, D]` (the normalised attention input)
     /// - returns: `[B, H, D_GAB_TEMPLATES]`
-    fn forward(&self, tokens: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn forward(&self, tokens: Tensor<3>) -> Tensor<3> {
         let [batch_size, _seq_len, _] = tokens.dims();
 
         // Mean-pool over tokens: [B, S, D] -> [B, D]
@@ -175,26 +179,26 @@ pub struct GabBiasProjectionConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct GabBiasProjection<B: Backend> {
+pub struct GabBiasProjection {
     /// Shared projection from template width to the full `(S, S)` bias map.
-    bias: Linear<B>,
+    bias: Linear,
 }
 
 impl GabBiasProjectionConfig {
-    fn init<B: Backend>(&self, device: &B::Device) -> GabBiasProjection<B> {
+    fn init(&self, device: &Device) -> GabBiasProjection {
         GabBiasProjection {
             bias: LinearConfig::new(self.template_width, N_SQUARES * N_SQUARES).init(device),
         }
     }
 }
 
-impl<B: Backend> GabBiasProjection<B> {
+impl GabBiasProjection {
     /// Projects per-head template vectors into attention bias maps.
     ///
     /// # Shape
     /// - `templates`: `[B, H, D_GAB_TEMPLATES]`
     /// - returns: `[B, H, S, S]`
-    fn forward(&self, templates: Tensor<B, 3>) -> Tensor<B, 4> {
+    fn forward(&self, templates: Tensor<3>) -> Tensor<4> {
         let [batch_size, n_heads, _d_templates] = templates.dims();
 
         // Per-head bias maps: [B, H, D3] -> [B, H, S*S] -> [B, H, S, S]
@@ -217,23 +221,23 @@ pub struct GabEncoderBlockConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct GabEncoderBlock<B: Backend> {
-    norm_attn: LayerNorm<B>,
-    gab: GabHead<B>,
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    out_proj: Linear<B>,
-    norm_ff: LayerNorm<B>,
-    ff_in: Linear<B>,
-    ff_out: Linear<B>,
+pub struct GabEncoderBlock {
+    norm_attn: LayerNorm,
+    gab: GabHead,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    out_proj: Linear,
+    norm_ff: LayerNorm,
+    ff_in: Linear,
+    ff_out: Linear,
     d_model: usize,
     n_heads: usize,
     d_head: usize,
 }
 
 impl GabEncoderBlockConfig {
-    fn init<B: Backend>(&self, device: &B::Device) -> GabEncoderBlock<B> {
+    fn init(&self, device: &Device) -> GabEncoderBlock {
         GabEncoderBlock {
             norm_attn: LayerNormConfig::new(self.d_model).init(device),
             gab: self.gab.init(device),
@@ -251,8 +255,8 @@ impl GabEncoderBlockConfig {
     }
 }
 
-impl<B: Backend> GabEncoderBlock<B> {
-    fn attention(&self, x: Tensor<B, 3>, gab_bias: &GabBiasProjection<B>) -> Tensor<B, 3> {
+impl GabEncoderBlock {
+    fn attention(&self, x: Tensor<3>, gab_bias: &GabBiasProjection) -> Tensor<3> {
         let [batch_size, seq_len, _] = x.dims();
         let head_shape = [batch_size, seq_len, self.n_heads, self.d_head];
 
@@ -284,7 +288,7 @@ impl<B: Backend> GabEncoderBlock<B> {
     /// - `x`: `[B, S, D]` input tokens
     /// - `gab_bias`: GAB bias projection
     /// - returns: `[B, S, D]` output tokens
-    fn forward(&self, x: Tensor<B, 3>, gab_bias: &GabBiasProjection<B>) -> Tensor<B, 3> {
+    fn forward(&self, x: Tensor<3>, gab_bias: &GabBiasProjection) -> Tensor<3> {
         let h = self.norm_attn.forward(x.clone());
         let h = self.attention(h, gab_bias);
         let x = x + h;
@@ -305,7 +309,7 @@ pub struct PolicyHeadConfig {
 }
 
 impl PolicyHeadConfig {
-    fn init<B: Backend>(&self, device: &B::Device) -> PolicyHead<B> {
+    fn init(&self, device: &Device) -> PolicyHead {
         PolicyHead {
             sq_from_proj: LinearConfig::new(self.d_model, self.d_model)
                 .with_bias(false)
@@ -322,14 +326,14 @@ impl PolicyHeadConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct PolicyHead<B: Backend> {
-    sq_from_proj: Linear<B>,
-    sq_to_proj: Linear<B>,
-    promotion_bias_proj: Linear<B>,
+pub struct PolicyHead {
+    sq_from_proj: Linear,
+    sq_to_proj: Linear,
+    promotion_bias_proj: Linear,
     d_model: usize,
 }
 
-impl<B: Backend> PolicyHead<B> {
+impl PolicyHead {
     /// Computes the flattened policy logits.
     ///
     /// # Shape
@@ -342,7 +346,7 @@ impl<B: Backend> PolicyHead<B> {
     /// trailing 256 are promotion scores indexed
     /// `(from_file * 8 + to_file) * 4 + piece` (piece order: knight, bishop,
     /// rook, queen), matching [`chess_again_dataset::encode_move`].
-    fn forward(&self, tokens: Tensor<B, 3>) -> Tensor<B, 2> {
+    fn forward(&self, tokens: Tensor<3>) -> Tensor<2> {
         let [batch_size, n_squares, _] = tokens.dims();
         debug_assert_eq!(n_squares, N_SQUARES);
 
@@ -355,11 +359,8 @@ impl<B: Backend> PolicyHead<B> {
 
         // Last-rank to-square vectors: [B, S, D] -> [B, 8, D]
         let last_rank = sq_to.narrow(1, LAST_RANK_START, BOARD_SIZE);
-        // Promotion-piece biases: [B, 8, 4], scaled to the score scale
-        let promo_biases = self
-            .promotion_bias_proj
-            .forward(last_rank)
-            .mul_scalar((self.d_model as f32).sqrt());
+        // Promotion-piece biases: [B, 8, 4]
+        let promo_biases = self.promotion_bias_proj.forward(last_rank);
 
         // Base scores of penultimate->last-rank traversals: [B, 8, 8]
         let base = from_to
@@ -392,15 +393,15 @@ pub struct ValueHeadConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct ValueHead<B: Backend> {
-    norm: LayerNorm<B>,
-    hidden: Linear<B>,
-    wdl: Linear<B>,
+pub struct ValueHead {
+    norm: LayerNorm,
+    hidden: Linear,
+    wdl: Linear,
     d_model: usize,
 }
 
 impl ValueHeadConfig {
-    fn init<B: Backend>(&self, device: &B::Device) -> ValueHead<B> {
+    fn init(&self, device: &Device) -> ValueHead {
         ValueHead {
             norm: LayerNormConfig::new(self.d_model).init(device),
             hidden: LinearConfig::new(self.d_model, self.hidden_width).init(device),
@@ -410,13 +411,13 @@ impl ValueHeadConfig {
     }
 }
 
-impl<B: Backend> ValueHead<B> {
+impl ValueHead {
     /// Computes WDL logits from the trunk token stream.
     ///
     /// # Shape
     /// - `tokens`: `[B, S, D]`
     /// - returns: `[B, 3]` WDL logits
-    fn forward(&self, tokens: Tensor<B, 3>) -> Tensor<B, 2> {
+    fn forward(&self, tokens: Tensor<3>) -> Tensor<2> {
         let [batch_size, _seq_len, _d_model] = tokens.dims();
 
         // Mean-pool over tokens: [B, S, D] -> [B, D]
@@ -466,17 +467,17 @@ pub const V1_0_CONFIG: V1Config = V1Config {
 };
 
 #[derive(Module, Debug)]
-pub struct V1Model<B: Backend> {
-    input_proj: Linear<B>,
-    gab_bias: GabBiasProjection<B>,
-    blocks: Vec<GabEncoderBlock<B>>,
-    policy: PolicyHead<B>,
-    value: ValueHead<B>,
+pub struct V1Model {
+    input_proj: Linear,
+    gab_bias: GabBiasProjection,
+    blocks: Vec<GabEncoderBlock>,
+    policy: PolicyHead,
+    value: ValueHead,
 }
 
 impl V1Config {
     /// Builds a model with random weights using this architecture.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> V1Model<B> {
+    pub fn init(&self, device: &Device) -> V1Model {
         assert_eq!(
             self.encoder.d_model,
             self.encoder.n_heads * self.encoder.d_head
@@ -503,14 +504,14 @@ impl V1Config {
     }
 }
 
-impl<B: Backend> V1Model<B> {
+impl V1Model {
     /// Runs a forward pass over a batch of encoded boards.
     ///
     /// # Shape
     /// - `input`: `[B, 64, 20]` raw board encoding
     /// - returns: a [`V1Output`] with the flattened policy vector and the
     ///   value head logits
-    pub fn forward(&self, input: Tensor<B, 3>) -> V1Output<B> {
+    pub fn forward(&self, input: Tensor<3>) -> V1Output {
         // [B, 64, 20] -> [B, 64, 192] shared-token linear projection.
         let tokens = self.input_proj.forward(input);
 
@@ -534,27 +535,25 @@ impl<B: Backend> V1Model<B> {
 
 /// Per-head logits produced by one forward pass of [`V1Model`].
 #[derive(Debug, Clone)]
-pub struct V1Output<B: Backend> {
+pub struct V1Output {
     /// Flattened policy logits, `[B, 4352]`: the 4096 `source * 64 + dest`
     /// from-to entries followed by the 256 promotion entries indexed
     /// `(from_file * 8 + to_file) * 4 + piece` (piece order: knight, bishop,
     /// rook, queen), matching [`chess_again_dataset::encode_move`].
-    pub policy_logits: Tensor<B, 2>,
+    pub policy_logits: Tensor<2>,
     /// WDL logits (win / draw / loss), `[B, 3]`.
-    pub wdl_logits: Tensor<B, 2>,
+    pub wdl_logits: Tensor<2>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::DefaultBackend;
 
     #[test]
     fn forward_shapes_batched() {
-        type B = DefaultBackend;
-        let device = Default::default();
-        let model = V1_0_CONFIG.init::<B>(&device);
-        let input = Tensor::<B, 3>::zeros([2, N_SQUARES, V1_0_CONFIG.n_input_features], &device);
+        let device = crate::device::default_device();
+        let model = V1_0_CONFIG.init(&device);
+        let input = Tensor::<3>::zeros([2, N_SQUARES, V1_0_CONFIG.n_input_features], &device);
         let out = model.forward(input);
 
         assert_eq!(out.policy_logits.dims(), [2, N_POLICY_CLASSES]);
@@ -563,10 +562,9 @@ mod tests {
 
     #[test]
     fn forward_batch_of_one() {
-        type B = DefaultBackend;
-        let device = Default::default();
-        let model = V1_0_CONFIG.init::<B>(&device);
-        let input = Tensor::<B, 3>::zeros([1, N_SQUARES, V1_0_CONFIG.n_input_features], &device);
+        let device = crate::device::default_device();
+        let model = V1_0_CONFIG.init(&device);
+        let input = Tensor::<3>::zeros([1, N_SQUARES, V1_0_CONFIG.n_input_features], &device);
         let out = model.forward(input);
 
         assert_eq!(out.policy_logits.dims(), [1, N_POLICY_CLASSES]);

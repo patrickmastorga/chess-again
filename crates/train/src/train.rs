@@ -1,87 +1,69 @@
 use burn::module::Module;
 use burn::nn::loss::CrossEntropyLossConfig;
-use burn::tensor::{
-    Tensor, Transaction,
-    backend::{AutodiffBackend, Backend},
-};
+use burn::tensor::Tensor;
 use burn::train::metric::{Adaptor, LossInput};
 use burn::train::{InferenceStep, ItemLazy, TrainOutput, TrainStep};
+use burn::tensor::ExecutionError;
 use chess_again_network::{V1Model, V1Output};
 
 use crate::batcher::V1Batch;
 
 #[derive(Module, Debug)]
-pub struct V1TrainModel<B: Backend> {
-    model: V1Model<B>,
+pub struct V1TrainModel {
+    model: V1Model,
 }
 
-impl<B: Backend> V1TrainModel<B> {
-    pub fn new(model: V1Model<B>) -> Self {
+impl V1TrainModel {
+    pub fn new(model: V1Model) -> Self {
         Self { model }
     }
 
-    pub fn model(&self) -> &V1Model<B> {
+    pub fn model(&self) -> &V1Model {
         &self.model
     }
 }
 
-pub struct V1TrainOutput<B: Backend> {
-    pub output: V1Output<B>,
+pub struct V1TrainOutput {
+    pub output: V1Output,
     /// Total loss, the one reported to the metric system.
-    pub loss: Tensor<B, 1>,
-    pub policy_loss: Tensor<B, 1>,
-    pub wdl_loss: Tensor<B, 1>,
+    pub loss: Tensor<1>,
+    pub policy_loss: Tensor<1>,
+    pub wdl_loss: Tensor<1>,
 }
 
-pub struct V1InferenceOutput<B: Backend> {
-    pub output: V1Output<B>,
+pub struct V1InferenceOutput {
+    pub output: V1Output,
 }
 
-impl<B: Backend> ItemLazy for V1InferenceOutput<B> {
-    type ItemSync = ();
-
-    fn sync(self) {}
-}
-
-/// Losses moved off the autodiff backend so metrics can read them.
-pub struct V1TrainOutputSync<B: Backend> {
-    pub loss: Tensor<B, 1>,
-    pub policy_loss: Tensor<B, 1>,
-    pub wdl_loss: Tensor<B, 1>,
-}
-
-impl<B: AutodiffBackend> ItemLazy for V1TrainOutput<B> {
-    type ItemSync = V1TrainOutputSync<B::InnerBackend>;
-
-    fn sync(self) -> Self::ItemSync {
-        // One transfer for all the losses reported to metrics.
-        let [loss, policy_loss, wdl_loss] = Transaction::default()
-            .register(self.loss)
-            .register(self.policy_loss)
-            .register(self.wdl_loss)
-            .execute()
-            .try_into()
-            .expect("three registered tensors");
-
-        let device = &Default::default();
-        V1TrainOutputSync {
-            loss: Tensor::from_data(loss, device),
-            policy_loss: Tensor::from_data(policy_loss, device),
-            wdl_loss: Tensor::from_data(wdl_loss, device),
-        }
+impl ItemLazy for V1InferenceOutput {
+    fn sync(self) -> Result<Self, ExecutionError> {
+        self.output.policy_logits.device().flush()?;
+        Ok(self)
     }
 }
 
-/// Lets `LossMetric` read the synced total loss.
-impl<B: Backend> Adaptor<LossInput<B>> for V1TrainOutputSync<B> {
-    fn adapt(&self) -> LossInput<B> {
+impl ItemLazy for V1TrainOutput {
+    fn sync(self) -> Result<Self, ExecutionError> {
+        self.loss.device().flush()?;
+
+        Ok(V1TrainOutput {
+            output: self.output,
+            loss: self.loss.without_autodiff(),
+            policy_loss: self.policy_loss.without_autodiff(),
+            wdl_loss: self.wdl_loss.without_autodiff(),
+        })
+    }
+}
+
+impl Adaptor<LossInput> for V1TrainOutput {
+    fn adapt(&self) -> LossInput {
         LossInput::new(self.loss.clone())
     }
 }
 
-impl<B: Backend> InferenceStep for V1TrainModel<B> {
-    type Input = V1Batch<B>;
-    type Output = V1InferenceOutput<B>;
+impl InferenceStep for V1TrainModel {
+    type Input = V1Batch;
+    type Output = V1InferenceOutput;
 
     fn step(&self, item: Self::Input) -> Self::Output {
         V1InferenceOutput {
@@ -90,9 +72,9 @@ impl<B: Backend> InferenceStep for V1TrainModel<B> {
     }
 }
 
-impl<B: AutodiffBackend> TrainStep for V1TrainModel<B> {
-    type Input = V1Batch<B>;
-    type Output = V1TrainOutput<B>;
+impl TrainStep for V1TrainModel {
+    type Input = V1Batch;
+    type Output = V1TrainOutput;
 
     fn step(&self, item: Self::Input) -> TrainOutput<Self::Output> {
         let device = item.input.device();
@@ -125,12 +107,10 @@ impl<B: AutodiffBackend> TrainStep for V1TrainModel<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::Autodiff;
     use burn::data::dataloader::batcher::Batcher;
-    use burn::tensor::Device;
     use chess_again_core::{Board, GameResult, Move};
     use chess_again_dataset::RecordRSM;
-    use chess_again_network::{DefaultBackend, model::V1_0_CONFIG};
+    use chess_again_network::{default_device, model::V1_0_CONFIG};
 
     use crate::V1Batcher;
 
@@ -138,28 +118,27 @@ mod tests {
     fn synced_loss_feeds_the_loss_metric() {
         use burn::train::metric::{Adaptor, LossInput, Metric, MetricMetadata};
 
-        type B = Autodiff<DefaultBackend>;
         let board = Board::starting();
         let mv = Move::from_san("e4", &board).expect("e4 should be legal");
         let record = RecordRSM::from_board(&board, mv.into(), GameResult::Draw);
-        let device: Device<B> = Default::default();
+        let device = default_device().autodiff();
         let batch = V1Batcher.batch(vec![record], &device);
-        let model = V1TrainModel::new(V1_0_CONFIG.init::<B>(&device));
+        let model = V1TrainModel::new(V1_0_CONFIG.init(&device));
 
         let output = TrainStep::step(&model, batch).item;
-        let synced = output.sync();
+        let synced = output.sync().expect("sync should succeed on flex");
 
         // The adaptor must hand a real batch of losses to the metric.
-        let input: LossInput<<B as AutodiffBackend>::InnerBackend> = synced.adapt();
-        let mut metric =
-            burn::train::metric::LossMetric::<<B as AutodiffBackend>::InnerBackend>::new();
+        let input: LossInput = synced.adapt();
+        let mut metric = burn::train::metric::LossMetric::new();
         let metadata = MetricMetadata {
-            progress: burn::data::dataloader::Progress::new(1, 1),
-            global_progress: burn::data::dataloader::Progress::new(1, 1),
+            progress: burn::data::dataloader::Progress::new(1, 1, None),
             iteration: Some(1),
             lr: None,
         };
-        let entry = metric.update(&input, &metadata);
+        let entry = metric
+            .update(&input, &metadata)
+            .expect("loss metric reads the synced loss");
         assert!(
             !entry.formatted.is_empty(),
             "loss metric should render a value, got {entry:?}"
@@ -177,14 +156,13 @@ mod tests {
 
     #[test]
     fn train_step_combines_policy_and_value_losses() {
-        type B = Autodiff<DefaultBackend>;
         let board = Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
             .expect("test position should be valid");
         let mv = Move::from_san("e5", &board).expect("e5 should be legal");
         let record = RecordRSM::from_board(&board, mv.into(), GameResult::WhiteWin);
-        let device: Device<B> = Default::default();
+        let device = default_device().autodiff();
         let batch = V1Batcher.batch(vec![record], &device);
-        let model = V1TrainModel::new(V1_0_CONFIG.init::<B>(&device));
+        let model = V1TrainModel::new(V1_0_CONFIG.init(&device));
 
         let output = TrainStep::step(&model, batch).item;
 

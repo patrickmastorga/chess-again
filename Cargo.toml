@@ -27,7 +27,7 @@ chess-again-network = { path = "crates/network", version = "0.1.0" }
 chess-again-train = { path = "crates/train", version = "0.1.0" }
 # external
 anyhow = "1.0.104"
-burn = { version = "0.21.0", default-features = false }
+burn = { version = "0.22", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossbeam-channel = "0.5.17"

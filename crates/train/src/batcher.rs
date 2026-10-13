@@ -1,5 +1,5 @@
 use burn::data::dataloader::batcher::Batcher;
-use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
+use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 
 use chess_again_core::{Board, Color};
 use chess_again_dataset::{N_MOVE_INDICES, RECORD_RSM_SIZE, RecordRSM, encode_move};
@@ -13,21 +13,21 @@ const N_INPUT_FEATURES: usize = 20;
 const _: () = assert!(N_MOVE_INDICES == N_POLICY_CLASSES);
 
 #[derive(Debug, Clone)]
-pub struct V1Batch<B: Backend> {
+pub struct V1Batch {
     // input of size [B, 64, 20]
-    pub input: Tensor<B, 3>,
+    pub input: Tensor<3>,
     // policy illegal mask of size [B, 4352]: true where the index is not a
     // legal move, so masked logits are excluded from the policy loss
-    pub policy_illegal_mask: Tensor<B, 2, Bool>,
-    pub policy_targets: Tensor<B, 1, Int>,
-    pub wdl_targets: Tensor<B, 1, Int>,
+    pub policy_illegal_mask: Tensor<2, Bool>,
+    pub policy_targets: Tensor<1, Int>,
+    pub wdl_targets: Tensor<1, Int>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct V1Batcher;
 
-impl<B: Backend> Batcher<B, RecordRSM, V1Batch<B>> for V1Batcher {
-    fn batch(&self, records: Vec<RecordRSM>, device: &B::Device) -> V1Batch<B> {
+impl Batcher<RecordRSM, V1Batch> for V1Batcher {
+    fn batch(&self, records: Vec<RecordRSM>, device: &Device) -> V1Batch {
         let batch_size = records.len();
         let mut inputs = Vec::with_capacity(batch_size * N_SQUARES * N_INPUT_FEATURES);
         let mut policy_illegal_masks = vec![true; batch_size * N_POLICY_CLASSES];
@@ -103,36 +103,33 @@ fn mark_legal_moves(board: &Board, batch_index: usize, policy_illegal_masks: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::tensor::Device;
     use chess_again_core::{GameResult, Move, Square};
     use chess_again_dataset::N_NON_PROMOTION_MOVE_INDICES;
-    use chess_again_network::DefaultBackend;
 
     #[test]
     fn batches_normalized_record_targets_and_legal_masks() {
-        type B = DefaultBackend;
         let board = Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
             .expect("test position should be valid");
         let mv = Move::from_san("e5", &board).expect("e5 should be legal");
         let record = RecordRSM::from_board(&board, mv.into(), GameResult::WhiteWin);
 
-        let device: Device<B> = Default::default();
-        let batch: V1Batch<B> = V1Batcher.batch(vec![record], &device);
+        let device = chess_again_network::default_device();
+        let batch: V1Batch = V1Batcher.batch(vec![record], &device);
 
         assert_eq!(batch.input.dims(), [1, N_SQUARES, N_INPUT_FEATURES]);
         assert_eq!(batch.policy_illegal_mask.dims(), [1, N_POLICY_CLASSES]);
         // Black's e5 is stored mirrored: white's e2-e4 is the training target.
         assert_eq!(
-            batch.policy_targets.to_data().to_vec::<i32>().unwrap(),
+            batch.policy_targets.to_data().try_to_vec::<i32>().unwrap(),
             [(Square::from_algebraic("e2").unwrap().index() * N_SQUARES
                 + Square::from_algebraic("e4").unwrap().index()) as i32]
         );
-        assert_eq!(batch.wdl_targets.to_data().to_vec::<i32>().unwrap(), [2]);
+        assert_eq!(batch.wdl_targets.to_data().try_to_vec::<i32>().unwrap(), [2]);
 
         let policy_mask = batch
             .policy_illegal_mask
             .to_data()
-            .to_vec::<bool>()
+            .try_to_vec::<bool>()
             .unwrap();
         assert!(
             !policy_mask[Square::from_algebraic("e2").unwrap().index() * N_SQUARES
@@ -146,24 +143,23 @@ mod tests {
 
     #[test]
     fn promotion_targets_use_the_flattened_promotion_indices() {
-        type B = DefaultBackend;
         let board = Board::from_fen("4k3/7P/8/8/8/8/8/4K3 w - - 0 1")
             .expect("test position should be valid");
         let mv = Move::from_san("h8=Q", &board).expect("h8=Q should be legal");
         let record = RecordRSM::from_board(&board, mv.into(), GameResult::Draw);
 
-        let device: Device<B> = Default::default();
-        let batch: V1Batch<B> = V1Batcher.batch(vec![record], &device);
+        let device = chess_again_network::default_device();
+        let batch: V1Batch = V1Batcher.batch(vec![record], &device);
 
         // h7-h8 queen: index 4096 + (from_file * 8 + to_file) * 4 + queen.
         assert_eq!(
-            batch.policy_targets.to_data().to_vec::<i32>().unwrap(),
+            batch.policy_targets.to_data().try_to_vec::<i32>().unwrap(),
             [(N_NON_PROMOTION_MOVE_INDICES + (7 * 8 + 7) * 4 + 3) as i32]
         );
         let policy_mask = batch
             .policy_illegal_mask
             .to_data()
-            .to_vec::<bool>()
+            .try_to_vec::<bool>()
             .unwrap();
         assert!(!policy_mask[N_NON_PROMOTION_MOVE_INDICES + (7 * 8 + 7) * 4 + 3]);
         assert_eq!(

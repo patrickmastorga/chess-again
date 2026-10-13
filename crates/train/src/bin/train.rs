@@ -6,16 +6,17 @@
 use std::{fs, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
-use burn::backend::Autodiff;
 use burn::config::Config;
 use burn::grad_clipping::GradientClippingConfig;
+use burn::lr_scheduler::{
+    LrSchedulerConfig, cosine::CosineAnnealingLrSchedulerConfig,
+    linear::LinearLrSchedulerConfig, sequential::SequentialLrSchedulerConfig,
+};
 use burn::optim::AdamConfig;
-use burn::record::{DefaultFileRecorder, FullPrecisionSettings};
-use burn::tensor::backend::AutodiffBackend;
-use burn::train::metric::LossMetric;
+use burn::train::metric::{LearningRateMetric, LossMetric};
 use burn::train::{Learner, SupervisedTraining};
 use chess_again_dataset::{RecordRSM, StreamingLoader};
-use chess_again_network::{DefaultBackend, V1Config, default_device, model::V1_0_CONFIG};
+use chess_again_network::{V1Config, default_device, model::V1_0_CONFIG};
 use chess_again_train::{V1Batch, V1Batcher, V1TrainModel};
 
 /// Every setting for a training run, including the ones that used to be command
@@ -45,6 +46,10 @@ struct TrainConfig {
     seed: u64,
     #[config(default = 5e-4)]
     learning_rate: f64,
+    #[config(default = 1e-5)]
+    min_learning_rate: f64,
+    #[config(default = 1_000)]
+    warmup_steps: u64,
     resume_checkpoint: Option<usize>,
 }
 
@@ -73,21 +78,22 @@ fn config() -> TrainConfig {
     .with_data_workers(4)
     .with_seed(0)
     .with_learning_rate(5e-4)
+    .with_min_learning_rate(1e-5)
+    .with_warmup_steps(1_000)
 }
 
 pub fn main() -> Result<()> {
-    type B = Autodiff<DefaultBackend>;
-    type InferenceB = <B as AutodiffBackend>::InnerBackend;
-
     let config = config();
     fs::create_dir_all(&config.artifact_dir)
         .with_context(|| format!("failed to create {}", config.artifact_dir))?;
 
-    let device = default_device();
+    // Autodiff is runtime state in Burn 0.22: enable it on the device before
+    // the model and its inputs are created.
+    let device = default_device().autodiff();
     // The loader caps epochs in batches; the setting is in records so that it
     // stays meaningful if the batch size changes.
     let batches_per_epoch = config.records_per_epoch.div_ceil(config.batch_size as u64);
-    let train_loader = StreamingLoader::<B, RecordRSM, _, V1Batch<B>>::new(
+    let train_loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
         &config.train_dir,
         device.clone(),
         V1Batcher,
@@ -97,9 +103,9 @@ pub fn main() -> Result<()> {
     )
     .with_context(|| format!("failed to open train dataset {}", config.train_dir))?
     .with_batches_per_epoch(batches_per_epoch);
-    let test_loader = StreamingLoader::<InferenceB, RecordRSM, _, V1Batch<InferenceB>>::new(
+    let test_loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
         &config.test_dir,
-        device.clone(),
+        device.clone().without_autodiff(),
         V1Batcher,
         config.batch_size,
         config.data_workers,
@@ -124,21 +130,52 @@ pub fn main() -> Result<()> {
         train_loader.batches_per_epoch(),
     );
 
-    let model = V1TrainModel::new(config.model.init::<B>(&device));
-    let optimizer = config.optimizer.init::<B, V1TrainModel<B>>();
-    let learner = Learner::new(model, optimizer, config.learning_rate);
+    let model = V1TrainModel::new(config.model.init(&device));
+
+    // The scheduler advances once per optimizer step, not per batch, so the
+    // decay horizon is the batch count only while grad accumulation is 1.
+    let total_steps = (train_loader.batches_per_epoch() * config.epochs as u64) as usize;
+    let warmup_steps = config.warmup_steps as usize;
+    let decay_steps = total_steps.saturating_sub(warmup_steps);
+    let lr_scheduler = SequentialLrSchedulerConfig::new(
+        vec![
+            LrSchedulerConfig::Linear(LinearLrSchedulerConfig::new(
+                1e-6,
+                config.learning_rate,
+                warmup_steps,
+            )),
+            LrSchedulerConfig::Cosine(
+                CosineAnnealingLrSchedulerConfig::new(config.learning_rate, decay_steps)
+                    .with_min_lr(config.min_learning_rate),
+            ),
+        ],
+        vec![warmup_steps],
+    )
+    .init()
+    .map_err(|error| anyhow::anyhow!("invalid learning rate schedule: {error}"))?;
+    eprintln!(
+        "lr 1e-6 -> {} over {} warmup steps, then {} -> {} over {} decay steps",
+        config.learning_rate, warmup_steps, config.learning_rate, config.min_learning_rate,
+        decay_steps,
+    );
+
+    let learner = Learner::new(model, config.optimizer.init(), lr_scheduler);
 
     let mut training =
         SupervisedTraining::new(artifact_dir, Arc::new(train_loader), Arc::new(test_loader))
             .num_epochs(config.epochs)
-            // Report the running training loss to the renderer each iteration. The
-            // metric reads synced (non-autodiff) tensors, so it uses the inner backend.
-            .metric_train_numeric(LossMetric::<InferenceB>::new())
-            .with_file_checkpointer(DefaultFileRecorder::<FullPrecisionSettings>::new());
+            .metric_train_numeric(LossMetric::new())
+            .metric_train_numeric(LearningRateMetric::new())
+            .with_default_checkpointers();
     if let Some(checkpoint) = config.resume_checkpoint {
         training = training.checkpoint(checkpoint);
     }
-    training.launch(learner);
+    let result = training.launch(learner);
+
+    // Burn 0.22 stops instead of panicking when a run fails; report it.
+    if let Some(error) = result.error {
+        return Err(anyhow::anyhow!("training failed: {error}"));
+    }
 
     Ok(())
 }

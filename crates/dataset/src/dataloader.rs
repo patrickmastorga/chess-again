@@ -17,7 +17,8 @@ use zstd::stream::read::Decoder;
 
 use burn::data::dataloader::batcher::Batcher;
 use burn::data::dataloader::{DataLoader, DataLoaderIterator, Progress};
-use burn::tensor::backend::Backend;
+use burn::data::dataset::DatasetError;
+use burn::tensor::Device;
 
 use crate::encode::DecodeableFixedSize;
 use crate::read::read_chunk;
@@ -80,13 +81,13 @@ fn report_failure(result: thread::Result<Result<()>>, who: &str) {
 }
 
 /// Streams fixed-size records out of a sharded, zstd-compressed dataset as batches.
-pub struct StreamingLoader<B: Backend, R: DecodeableFixedSize, Bt, O>
+pub struct StreamingLoader<R: DecodeableFixedSize, Bt, O>
 where
-    Bt: Batcher<B, R, O>,
+    Bt: Batcher<R, O>,
 {
     /// Shard paths, shared with the decompressor thread.
     shards: Vec<PathBuf>,
-    device: B::Device,
+    device: Device,
     batcher: Arc<Bt>,
     batch_size: usize,
     workers: usize,
@@ -106,16 +107,15 @@ where
     marker: PhantomData<fn() -> (R, O)>,
 }
 
-impl<B, R, Bt, O> StreamingLoader<B, R, Bt, O>
+impl<R, Bt, O> StreamingLoader<R, Bt, O>
 where
-    B: Backend,
     R: DecodeableFixedSize + Send + 'static,
-    Bt: Batcher<B, R, O> + Send + Sync + 'static,
+    Bt: Batcher<R, O> + Send + Sync + 'static,
     O: Send + 'static,
 {
     pub fn new(
         dataset_dir: impl AsRef<Path>,
-        device: B::Device,
+        device: Device,
         batcher: Bt,
         batch_size: usize,
         workers: usize,
@@ -282,7 +282,7 @@ where
     /// Shuffles and batches the raw data received from the decompressor.
     fn worker(
         batcher: Arc<Bt>,
-        device: B::Device,
+        device: Device,
         batch_size: usize,
         seed: u64,
         rx: Receiver<Vec<u8>>,
@@ -386,9 +386,9 @@ impl<O> StreamingIter<O> {
 }
 
 impl<O> Iterator for StreamingIter<O> {
-    type Item = O;
+    type Item = Result<O, DatasetError>;
 
-    fn next(&mut self) -> Option<O> {
+    fn next(&mut self) -> Option<Self::Item> {
         if self.capped && self.items_processed >= self.items_total {
             return None;
         }
@@ -396,7 +396,7 @@ impl<O> Iterator for StreamingIter<O> {
         match self.rx.recv() {
             Ok(batch) => {
                 self.items_processed += 1;
-                Some(batch)
+                Some(Ok(batch))
             }
             Err(_) => None,
         }
@@ -405,15 +405,18 @@ impl<O> Iterator for StreamingIter<O> {
 
 impl<O> DataLoaderIterator<O> for StreamingIter<O> {
     fn progress(&self) -> Progress {
-        Progress::new(self.items_processed.min(self.items_total), self.items_total)
+        Progress::new(
+            self.items_processed.min(self.items_total),
+            self.items_total,
+            Some("batches".to_string()),
+        )
     }
 }
 
-impl<B, R, Bt, O> DataLoader<B, O> for StreamingLoader<B, R, Bt, O>
+impl<R, Bt, O> DataLoader<O> for StreamingLoader<R, Bt, O>
 where
-    B: Backend,
     R: DecodeableFixedSize + Send + 'static,
-    Bt: Batcher<B, R, O> + Send + Sync + 'static,
+    Bt: Batcher<R, O> + Send + Sync + 'static,
     O: Send + 'static,
 {
     fn iter<'a>(&'a self) -> Box<dyn DataLoaderIterator<O> + 'a> {
@@ -465,7 +468,7 @@ where
         self.num_items
     }
 
-    fn to_device(&self, device: &B::Device) -> Arc<dyn DataLoader<B, O>> {
+    fn to_device(&self, device: &Device) -> Arc<dyn DataLoader<O>> {
         // Clone dataloader around new device with fresh stream
         Arc::new(Self {
             shards: self.shards.clone(),
@@ -483,16 +486,15 @@ where
         })
     }
 
-    fn slice(&self, _start: usize, _end: usize) -> Arc<dyn DataLoader<B, O>> {
+    fn slice(&self, _start: usize, _end: usize) -> Arc<dyn DataLoader<O>> {
         unimplemented!("a shuffled decompressed stream has no stable indices to slice")
     }
 }
 
-impl<B, R, Bt, O> Drop for StreamingLoader<B, R, Bt, O>
+impl<R, Bt, O> Drop for StreamingLoader<R, Bt, O>
 where
-    B: Backend,
     R: DecodeableFixedSize,
-    Bt: Batcher<B, R, O>,
+    Bt: Batcher<R, O>,
 {
     fn drop(&mut self) {
         // `&mut self` means no other thread can be inside `iter` right now, so

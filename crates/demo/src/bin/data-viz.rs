@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use burn::backend::Flex;
 use burn::data::dataloader::DataLoader;
 use burn::data::dataloader::batcher::Batcher;
 use burn::tensor::Device;
@@ -12,8 +11,6 @@ use eframe::egui::{self, Color32};
 use chess_again_core::{Board, GameResult, UciMove};
 use chess_again_dataset::{RecordRSM, StreamingLoader};
 use chess_again_gui::GuiBoard;
-
-type VizBackend = Flex;
 
 /// Batcher threads per loader, alongside the one decompressor thread.
 const DATA_WORKERS: usize = 2;
@@ -32,11 +29,11 @@ struct Args {
 #[derive(Debug, Clone)]
 struct VizBatcher;
 
-impl Batcher<VizBackend, RecordRSM, Vec<(Board, UciMove, GameResult)>> for VizBatcher {
+impl Batcher<RecordRSM, Vec<(Board, UciMove, GameResult)>> for VizBatcher {
     fn batch(
         &self,
         records: Vec<RecordRSM>,
-        _device: &Device<VizBackend>,
+        _device: &Device,
     ) -> Vec<(Board, UciMove, GameResult)> {
         records
             .into_iter()
@@ -52,13 +49,12 @@ impl Batcher<VizBackend, RecordRSM, Vec<(Board, UciMove, GameResult)>> for VizBa
 fn main() -> Result<()> {
     let args = Args::parse();
     let loader = Arc::new(StreamingLoader::<
-        VizBackend,
         RecordRSM,
         VizBatcher,
         Vec<(Board, UciMove, GameResult)>,
     >::new(
         &args.dataset_dir,
-        Default::default(),
+        Device::flex(),
         VizBatcher,
         1,
         DATA_WORKERS,
@@ -69,6 +65,7 @@ fn main() -> Result<()> {
     let mut current = loader
         .iter()
         .next()
+        .transpose()?
         .and_then(|mut batch| batch.pop())
         .with_context(|| format!("dataset {} has no records", args.dataset_dir.display()))?;
     let mut board = GuiBoard::new();
@@ -99,7 +96,13 @@ fn main() -> Result<()> {
             board.set_highlight(current.1.source(), SOURCE_HIGHLIGHT_COLOR);
             board.set_highlight(current.1.dest(), DEST_HIGHLIGHT_COLOR);
             if board.show(ui).clicked() {
-                if let Some(next) = examples.next().and_then(|mut batch| batch.pop()) {
+                if let Some(next) = examples
+                    .next()
+                    .transpose()
+                    .ok()
+                    .flatten()
+                    .and_then(|mut batch| batch.pop())
+                {
                     current = next;
                     ui.ctx().request_repaint();
                 }

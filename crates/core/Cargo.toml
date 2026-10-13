@@ -1,0 +1,12 @@
+[package]
+name = "chess-again-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+
+[[test]]
+name = "perft"
+path = "tests/perft.rs"
+test = false

@@ -1,0 +1,23 @@
+[package]
+name = "chess-again-dataset"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chess-again-core = { workspace = true }
+anyhow = { workspace = true }
+burn = { workspace = true, features = ["std", "dataset"] }
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+rand = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+# The dataloader tests exercise a real backend. `flex` is CPU, eager and
+# deterministic, matching the workspace default, but must not become a runtime
+# dependency of the library itself.
+burn = { workspace = true, features = ["std", "dataset", "flex"] }
+
+[[bin]]
+name = "validate"
+path = "src/bin/validate.rs"

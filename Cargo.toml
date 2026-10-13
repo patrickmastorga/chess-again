@@ -1,8 +1,38 @@
-[package]
-name = "chess-again"
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/dataset",
+    "crates/demo",
+    "crates/engine",
+    "crates/gui",
+    "crates/network",
+    "crates/train",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/patrickmastorga/chess-again"
 
-[dependencies]
+[workspace.dependencies]
+# internal — path + version
+chess-again-core = { path = "crates/core",    version = "0.1.0" }
+chess-again-dataset = { path = "crates/dataset", version = "0.1.0" }
+chess-again-demo = { path = "crates/demo", version = "0.1.0" }
+chess-again = { path = "crates/engine",  version = "0.1.0" }
+chess-again-gui = { path = "crates/gui",  version = "0.1.0" }
+chess-again-network = { path = "crates/network", version = "0.1.0" }
+chess-again-train = { path = "crates/train", version = "0.1.0" }
+# external
+anyhow = "1.0.104"
+burn = { version = "0.21.0", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-rand = "0.9"
+clap = { version = "4.6.7", features = ["derive"] }
+crossbeam-channel = "0.5.17"
+eframe = "0.36.2"
+egui = "0.36.2"
+egui_extras = { version = "0.36.2", features = ["svg"] }
+rand = "0.10.3"
+zstd = "0.14.0"

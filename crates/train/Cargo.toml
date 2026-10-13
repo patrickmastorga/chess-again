@@ -1,0 +1,17 @@
+[package]
+name = "chess-again-train"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chess-again-core = { workspace = true }
+chess-again-network = { workspace = true }
+chess-again-dataset = { workspace = true }
+anyhow = { workspace = true }
+burn = { workspace = true, features = ["std", "train", "dataset", "tui"] }
+
+[features]
+default = []
+metal  = ["chess-again-network/metal"]
+cuda   = ["chess-again-network/cuda"]
+webgpu = ["chess-again-network/webgpu"]

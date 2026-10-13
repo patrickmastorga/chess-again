@@ -1,0 +1,14 @@
+[package]
+name = "chess-again"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chess-again-core = { workspace = true }
+chess-again-network = { workspace = true }
+
+[features]
+default = []
+metal = ["chess-again-network/metal"]
+cuda = ["chess-again-network/cuda"]
+webgpu = ["chess-again-network/webgpu"]

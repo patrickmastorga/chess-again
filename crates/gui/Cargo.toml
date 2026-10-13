@@ -1,0 +1,10 @@
+[package]
+name = "chess-again-gui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chess-again-core = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+egui_extras = { workspace = true }

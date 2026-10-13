@@ -1,0 +1,27 @@
+[package]
+name = "chess-again-demo"
+version.workspace = true
+edition.workspace = true
+# Interactive demos and dataset viewers. Never published, and pulls in
+# GUI/plotting dependencies that the library crates deliberately avoid.
+publish = false
+
+[dependencies]
+chess-again-core = { workspace = true }
+chess-again-dataset = { workspace = true }
+chess-again-gui = { workspace = true }
+
+anyhow = { workspace = true }
+burn = { workspace = true, features = ["std", "dataset", "flex"] }
+clap = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+
+[[bin]]
+name = "cata-viz"
+path = "src/bin/data-viz.rs"
+
+[[bin]]
+name = "play-uci"
+path = "src/bin/play-uci.rs"
+

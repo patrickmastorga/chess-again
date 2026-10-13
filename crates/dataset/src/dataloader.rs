@@ -181,6 +181,34 @@ where
         }
     }
 
+    /// Stops the running pass, joining its producer threads.
+    ///
+    /// A capped pass never ends on its own, so its decompressor and batchers
+    /// stay alive for the whole run unless this is called or the loader is
+    /// dropped. Use this to release them early, or to make the next epoch
+    /// start a fresh pass with a new shuffle order.
+    ///
+    /// Does nothing when no pass is running. The next call to
+    /// [`iter`](DataLoader::iter) starts a new one.
+    ///
+    /// # Blocking
+    ///
+    /// This waits for the producer threads to unwind, and a worker only
+    /// notices it should stop once the batch queue disconnects. A live
+    /// [`StreamingIter`] holds its own handle on that queue, so calling this
+    /// while an iterator from this loader is still alive blocks until that
+    /// iterator is dropped. Drop the iterator first.
+    pub fn shutdown_threads(&self) {
+        // The same lock `iter` uses, so a shutdown cannot interleave with a
+        // reap and start a second set of workers alongside the ones being
+        // joined.
+        let mut stream = self.stream.lock().expect("stream slot is never poisoned");
+
+        if let Some(running) = stream.take() {
+            running.shutdown();
+        }
+    }
+
     /// Spawns a pass: one decompressor and `workers` batcher threads.
     ///
     /// Called only from [`iter`](DataLoader::iter), under the `stream` lock, so
@@ -189,10 +217,9 @@ where
         let pass = self.pass.fetch_add(1, Ordering::Relaxed);
         let seed = self.seed ^ pass as u64;
 
-        // Shard order is decided here rather than in the decompressor: the list
-        // is cheap to clone, and this keeps the decompressor free of any RNG.
-        let mut shards = self.shards.clone();
-        shards.shuffle(&mut StdRng::seed_from_u64(seed));
+        // The shard list is handed over unshuffled: the decompressor decides
+        // the order, because it reshuffles on every repeat of a capped pass.
+        let shards = self.shards.clone();
 
         let (batches_tx, batches_rx) = bounded(BATCH_QUEUE);
         let (raw_tx, raw_rx) = bounded::<Vec<u8>>(self.workers * RAW_QUEUE_PER_WORKER);
@@ -219,9 +246,13 @@ where
         drop(batches_tx);
 
         let buffer_records = self.buffer_size;
+        // A capped epoch stops early and is continued by the next one, so if
+        // the shards run out mid-epoch the pass has to start over rather than
+        // end. An uncapped epoch covers the dataset exactly once.
+        let capped = self.batches_per_epoch != 0;
         let decompressor = thread::Builder::new()
             .name("dataloader-decompressor".to_string())
-            .spawn(move || Self::decompressor(shards, buffer_records, raw_tx))?;
+            .spawn(move || Self::decompressor(shards, buffer_records, seed, capped, raw_tx))?;
 
         Ok(Stream {
             rx: batches_rx,
@@ -231,52 +262,71 @@ where
     }
 
     /// Streams decompressed records out of the shards and into the raw queue.
-    fn decompressor(shards: Vec<PathBuf>, buffer_size: usize, tx: Sender<Vec<u8>>) -> Result<()> {
+    ///
+    /// `shards` arrives unshuffled; the order is decided here, once per pass,
+    /// from `seed`. When `capped` is set the pass repeats, reshuffling the
+    /// shards each time, so a caller reading a fixed number of batches per
+    /// epoch keeps getting records instead of reaching the end of the data.
+    fn decompressor(
+        shards: Vec<PathBuf>,
+        buffer_size: usize,
+        seed: u64,
+        capped: bool,
+        tx: Sender<Vec<u8>>,
+    ) -> Result<()> {
+        let mut rng = StdRng::seed_from_u64(seed);
         let mut buffer = vec![0u8; buffer_size * R::SIZE];
         // Bytes of `buffer` already filled, carried across shard boundaries so
         // that a short shard does not produce a short chunk.
         let mut filled = 0usize;
 
-        for shard in shards {
-            let name = shard.display().to_string();
-            let file = File::open(&shard).with_context(|| format!("failed to open {name}"))?;
-            let mut decoder = Decoder::with_buffer(BufReader::new(file))
-                .with_context(|| format!("failed to decompress {name}"))?;
+        loop {
+            let mut order = shards.clone();
+            order.shuffle(&mut rng);
 
-            while filled < buffer.len() {
-                let room = buffer.len() - filled;
-                let read = read_chunk(&mut decoder, &mut buffer[filled..])
-                    .with_context(|| format!("failed to read {name}"))?;
-                filled += read;
+            for shard in order {
+                let name = shard.display().to_string();
+                let file = File::open(&shard).with_context(|| format!("failed to open {name}"))?;
+                let mut decoder = Decoder::with_buffer(BufReader::new(file))
+                    .with_context(|| format!("failed to decompress {name}"))?;
 
-                // A short read is the end of the shard.
-                if read < room {
-                    if filled % R::SIZE != 0 {
-                        bail!(
-                            "{name}: shard ends with {} bytes of a {}-byte record",
-                            filled % R::SIZE,
-                            R::SIZE
-                        );
+                while filled < buffer.len() {
+                    let room = buffer.len() - filled;
+                    let read = read_chunk(&mut decoder, &mut buffer[filled..])
+                        .with_context(|| format!("failed to read {name}"))?;
+                    filled += read;
+
+                    // A short read is the end of the shard.
+                    if read < room {
+                        if filled % R::SIZE != 0 {
+                            bail!(
+                                "{name}: shard ends with {} bytes of a {}-byte record",
+                                filled % R::SIZE,
+                                R::SIZE
+                            );
+                        }
+                        break;
                     }
-                    break;
-                }
 
-                // Send the full buffer.
-                if tx.send(buffer.clone()).is_err() {
-                    // The workers are gone, so this pass is over.
+                    // Send the full buffer.
+                    if tx.send(buffer.clone()).is_err() {
+                        // The workers are gone, so this pass is over.
+                        return Ok(());
+                    }
+                    filled = 0;
+                }
+            }
+
+            if !capped {
+                // The shards ran out. Whatever is left in the buffer is a
+                // partial one, holding whole records because every shard was
+                // checked as it ended.
+                if filled > 0 && tx.send(buffer[..filled].to_vec()).is_err() {
                     return Ok(());
                 }
-                filled = 0;
+                return Ok(());
             }
         }
-
-        // The shards ran out with a partial buffer left, which holds whole
-        // records because every shard was checked as it ended.
-        if filled > 0 && tx.send(buffer[..filled].to_vec()).is_err() {
-            return Ok(());
-        }
-
-        Ok(())
     }
 
     /// Shuffles and batches the raw data received from the decompressor.

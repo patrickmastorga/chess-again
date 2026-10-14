@@ -147,6 +147,8 @@ pub struct V1PretrainConfig {
     pub grad_accumulation: usize,
     #[config(default = 4)]
     pub data_workers: usize,
+    #[config(default = 2)]
+    pub batch_workers: usize,
     #[config(default = 0)]
     pub seed: u64,
     /// The learning rate the warmup ramps up to and the cosine decays from.
@@ -225,22 +227,24 @@ pub fn pretrain_v1(config: V1PretrainConfig, device: Device) -> Result<()> {
     // `grad_accumulation` batches.
     let batches_per_epoch = config.steps_per_epoch * config.grad_accumulation as u64;
 
+    // The loader is built without a device: the training loop calls
+    // `to_device` itself, for training and validation alike.
     let train_loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
         &config.train_dir,
-        device.clone(),
         V1Batcher,
         config.batch_size,
         config.data_workers,
+        config.batch_workers,
         config.seed,
     )
     .with_context(|| format!("failed to open train dataset {}", config.train_dir))?
-    .with_batches_per_epoch(batches_per_epoch);
+    .with_batches_per_epoch(batches_per_epoch as usize);
     let test_loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
         &config.test_dir,
-        device.clone().without_autodiff(),
         V1Batcher,
         config.batch_size,
-        config.data_workers,
+        1,
+        config.batch_workers,
         config.seed,
     )
     .with_context(|| format!("failed to open test dataset {}", config.test_dir))?;

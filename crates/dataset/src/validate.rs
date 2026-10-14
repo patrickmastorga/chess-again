@@ -19,8 +19,8 @@ use std::thread;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, bounded};
 
-use crate::encode::DecodeableFixedSize;
 use crate::dataloader::read_manifest;
+use crate::encode::DecodeableFixedSize;
 use crate::read::read_chunk;
 
 /// Records decoded per chunk. Each chunk becomes one worker job.
@@ -275,7 +275,6 @@ where
 
     (decode_errors, decode_error_samples)
 }
-
 
 #[cfg(test)]
 mod tests {

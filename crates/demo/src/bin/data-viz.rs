@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use burn::data::dataloader::DataLoader;
@@ -11,9 +10,6 @@ use eframe::egui::{self, Color32};
 use chess_again_core::{Board, GameResult, UciMove};
 use chess_again_dataset::{RecordRSM, StreamingLoader};
 use chess_again_gui::GuiBoard;
-
-/// Batcher threads per loader, alongside the one decompressor thread.
-const DATA_WORKERS: usize = 2;
 
 const SOURCE_HIGHLIGHT_COLOR: Color32 = Color32::from_rgba_premultiplied(16, 75, 35, 150);
 const DEST_HIGHLIGHT_COLOR: Color32 = Color32::from_rgba_premultiplied(35, 140, 60, 150);
@@ -48,18 +44,17 @@ impl Batcher<RecordRSM, Vec<(Board, UciMove, GameResult)>> for VizBatcher {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let loader = Arc::new(StreamingLoader::<
-        RecordRSM,
-        VizBatcher,
-        Vec<(Board, UciMove, GameResult)>,
-    >::new(
+    // Built without a device, then bound to one: `to_device` is how a loader
+    // learns which device to assemble batches on.
+    let loader = StreamingLoader::<RecordRSM, VizBatcher, Vec<(Board, UciMove, GameResult)>>::new(
         &args.dataset_dir,
-        Device::flex(),
         VizBatcher,
         1,
-        DATA_WORKERS,
+        1,
+        1,
         args.seed,
-    )?);
+    )?
+    .to_device(&Device::flex());
     // The UI closure is `'static`, so the loader it iterates has to be owned by
     // the closure too, and the iterator is built inside it.
     let mut current = loader

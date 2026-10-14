@@ -12,6 +12,15 @@ pub const N_PROMOTION_MOVE_INDICES: usize = 8 * 8 * 4;
 /// Size of the flattened policy vector the model predicts: every from-to pair
 pub const N_MOVE_INDICES: usize = N_NON_PROMOTION_MOVE_INDICES + N_PROMOTION_MOVE_INDICES;
 
+/// A type that can be decoded from a string of bytes.
+pub trait Decodeable: Sized {
+    /// Maximum number of bytes the type occupies when encoded.
+    const MAX_SIZE: usize;
+    /// Reads up to `max` values of this type from the beginning of the given byte slice,
+    /// returning a vector of the values and the number of bytes read.
+    fn read_from_bytes(bytes: &[u8], max: usize) -> Result<(Vec<Self>, usize), String>;
+}
+
 /// A type that can be decoded from a fixed-size byte array.
 pub trait DecodeableFixedSize: Sized {
     /// Number of bytes the type occupies when encoded.
@@ -27,6 +36,26 @@ pub trait DecodeableFixedSize: Sized {
     /// whether a record is sound, so every check a record type needs belongs
     /// here rather than in the validator.
     fn validate(&self) -> Result<(), String>;
+}
+
+impl<T: DecodeableFixedSize> Decodeable for T {
+    const MAX_SIZE: usize = T::SIZE;
+
+    fn read_from_bytes(bytes: &[u8], max: usize) -> Result<(Vec<Self>, usize), String> {
+        let cap = bytes.len() / T::SIZE;
+        if cap <= max && bytes.len() % T::SIZE != 0 {
+            return Err("remaining bytes is less than a full record".to_string());
+        }
+        let n = cap.min(max);
+        Ok((
+            bytes
+                .chunks_exact(T::SIZE)
+                .take(n)
+                .map(T::from_bytes)
+                .collect(),
+            T::SIZE * n,
+        ))
+    }
 }
 
 /// Training data record format, without the evaluation:

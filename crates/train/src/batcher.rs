@@ -124,7 +124,10 @@ mod tests {
             [(Square::from_algebraic("e2").unwrap().index() * N_SQUARES
                 + Square::from_algebraic("e4").unwrap().index()) as i32]
         );
-        assert_eq!(batch.wdl_targets.to_data().try_to_vec::<i32>().unwrap(), [2]);
+        assert_eq!(
+            batch.wdl_targets.to_data().try_to_vec::<i32>().unwrap(),
+            [2]
+        );
 
         let policy_mask = batch
             .policy_illegal_mask

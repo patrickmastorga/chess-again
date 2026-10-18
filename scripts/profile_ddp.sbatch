@@ -1,7 +1,8 @@
 #!/bin/bash
 #SBATCH -J v1-profile
 #SBATCH -N1
-#SBATCH --ntasks-per-node=8
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:H100:8
 #SBATCH -C H100
 #SBATCH --mem-per-gpu=224GB

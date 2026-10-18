@@ -14,9 +14,12 @@ use burn::module::Module;
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::optim::AdamWConfig;
 use burn::tensor::ExecutionError;
+use burn::tensor::distributed::{DistributedConfig, ReduceOperation};
 use burn::tensor::{Device, Tensor};
 use burn::train::metric::{Adaptor, LearningRateMetric, LossInput, LossMetric};
-use burn::train::{InferenceStep, ItemLazy, Learner, SupervisedTraining, TrainOutput, TrainStep};
+use burn::train::{
+    ExecutionStrategy, InferenceStep, ItemLazy, Learner, SupervisedTraining, TrainOutput, TrainStep,
+};
 use chess_again_dataset::{RecordRSM, StreamingLoader};
 use chess_again_network::{V1Config, V1Model, V1Output};
 
@@ -207,10 +210,15 @@ fn pretrain_lr_scheduler(config: &V1PretrainConfig, steps: usize) -> Result<Modu
 
 /// Runs a V1 pretraining pass on `device`.
 ///
-/// `device` carries the autodiff setting: pass a device from
-/// `default_device().autodiff()` to train, since autodiff is runtime state in
-/// Burn 0.22 and must be enabled before the model and its inputs are created.
+/// `device` must carry autodiff: pass a device from
+/// `default_device().autodiff()`. The model is initialized here, and a
+/// parameter's autodiff registration is fixed when it is created, so Burn
+/// forcing autodiff on the device it trains with cannot repair it afterwards.
 pub fn pretrain_v1(config: V1PretrainConfig, device: Device) -> Result<()> {
+    if !device.is_autodiff() {
+        bail!("the training device must carry autodiff, e.g. default_device().autodiff()");
+    }
+
     fs::create_dir_all(&config.artifact_dir)
         .with_context(|| format!("failed to create {}", config.artifact_dir))?;
 
@@ -299,6 +307,133 @@ pub fn pretrain_v1(config: V1PretrainConfig, device: Device) -> Result<()> {
     let result = training.launch(learner);
 
     // Burn 0.22 stops instead of panicking when a run fails; report it.
+    if let Some(error) = result.error {
+        return Err(anyhow::anyhow!("training failed: {error}"));
+    }
+
+    Ok(())
+}
+
+/// Runs a V1 pretraining pass across several devices with distributed data
+/// parallel training.
+///
+/// `devices` are the GPUs on this node; each gets its own copy of the model and
+/// its own shard of every batch, and the gradients are all-reduced after each
+/// optimizer step. One process drives them all, one thread per device.
+///
+/// At least `devices[0]` must carry autodiff, since the model is initialized
+/// there; enabling it on every device is harmless.
+///
+/// `batch_size` is the **total** across all devices. The loader is built with
+/// `batch_size / devices.len()`, so each device contributes an even share and
+/// the effective batch is still `batch_size`.
+pub fn pretrain_v1_ddp(config: V1PretrainConfig, devices: &[Device]) -> Result<()> {
+    if devices.is_empty() {
+        bail!("distributed training needs at least one device");
+    }
+    if !devices[0].is_autodiff() {
+        bail!("the first device must carry autodiff, since the model is initialized there");
+    }
+    if config.grad_accumulation == 0 {
+        bail!("gradient accumulation must be at least one");
+    }
+    if config.steps_per_epoch == 0 {
+        bail!("an epoch must have at least one optimizer step");
+    }
+
+    let n_devices = devices.len();
+    // `batch_size` is the total across devices, so it has to split evenly.
+    if !config.batch_size.is_multiple_of(n_devices) {
+        bail!(
+            "batch size {} must divide evenly across {} devices",
+            config.batch_size,
+            n_devices
+        );
+    }
+    let batch_size = config.batch_size / n_devices;
+
+    // Each step consumes `grad_accumulation` batches on every device.
+    let batches_per_epoch = config.steps_per_epoch * config.grad_accumulation as u64;
+    // The scheduler advances once per optimizer step, exactly as single-device.
+    let total_steps = (config.steps_per_epoch * config.epochs as u64) as usize;
+
+    let train_loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
+        &config.train_dir,
+        V1Batcher,
+        batch_size,
+        config.data_workers,
+        config.batch_workers,
+        config.seed,
+    )
+    .with_context(|| format!("failed to open train dataset {}", config.train_dir))?
+    .with_batches_per_epoch(batches_per_epoch as usize);
+    // Validation runs on one device, unsplit, at the full batch size.
+    let test_loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
+        &config.test_dir,
+        V1Batcher,
+        config.batch_size,
+        1,
+        config.batch_workers,
+        config.seed,
+    )
+    .with_context(|| format!("failed to open test dataset {}", config.test_dir))?;
+
+    let artifact_dir = Path::new(&config.artifact_dir);
+    fs::create_dir_all(artifact_dir)
+        .with_context(|| format!("failed to create {}", config.artifact_dir))?;
+    config
+        .save(artifact_dir.join("config.json"))
+        .with_context(|| {
+            format!(
+                "failed to save training config in {}",
+                artifact_dir.display()
+            )
+        })?;
+
+    let lr_scheduler = pretrain_lr_scheduler(&config, total_steps)?;
+    eprintln!(
+        "{} epochs of {} optimizer steps on {} devices ({} batches of {} records each per device)",
+        config.epochs, config.steps_per_epoch, n_devices, batches_per_epoch, batch_size,
+    );
+    eprintln!(
+        "effective batch {} records (batch {} / {} devices x accumulation {})",
+        config.batch_size as u64 * config.grad_accumulation as u64,
+        config.batch_size,
+        n_devices,
+        config.grad_accumulation,
+    );
+
+    // The model is initialized on `devices[0]`, which must therefore carry
+    // autodiff: a parameter's registration is fixed when it is created, so
+    // Burn forcing autodiff on the devices it trains with cannot repair it.
+    // The remaining devices may be plain.
+    let model = V1TrainModel::new(config.model.init(&devices[0]));
+    let learner = Learner::new(model, config.optimizer.init(), lr_scheduler);
+
+    // Each device sees a disjoint shard of the data, so averaging the gradients
+    // is the correct reduction.
+    let strategy = ExecutionStrategy::ddp(
+        devices.to_vec(),
+        DistributedConfig {
+            all_reduce_op: ReduceOperation::Mean,
+        },
+    );
+
+    let mut training =
+        SupervisedTraining::new(artifact_dir, Arc::new(train_loader), Arc::new(test_loader))
+            .num_epochs(config.epochs)
+            .metric_train_numeric(LossMetric::new())
+            .metric_train_numeric(LearningRateMetric::new())
+            .with_training_strategy(strategy.into())
+            .with_default_checkpointers();
+    if config.grad_accumulation > 1 {
+        training = training.grads_accumulation(config.grad_accumulation);
+    }
+    if let Some(checkpoint) = config.resume_checkpoint {
+        training = training.checkpoint(checkpoint);
+    }
+    let result = training.launch(learner);
+
     if let Some(error) = result.error {
         return Err(anyhow::anyhow!("training failed: {error}"));
     }

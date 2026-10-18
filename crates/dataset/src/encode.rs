@@ -42,11 +42,7 @@ impl<T: DecodeableFixedSize> Decodeable for T {
     const MAX_SIZE: usize = T::SIZE;
 
     fn read_from_bytes(bytes: &[u8], max: usize) -> Result<(Vec<Self>, usize), String> {
-        let cap = bytes.len() / T::SIZE;
-        if cap <= max && bytes.len() % T::SIZE != 0 {
-            return Err("remaining bytes is less than a full record".to_string());
-        }
-        let n = cap.min(max);
+        let n = max.min(bytes.len() / T::SIZE);
         Ok((
             bytes
                 .chunks_exact(T::SIZE)

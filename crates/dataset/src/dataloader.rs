@@ -121,10 +121,6 @@ where
     window_size: usize,
     device: Option<Device>,
     /// The pass currently running, if any. Shared among all copies of the loader.
-    ///
-    /// Guarded by a mutex so a caller of [`iter`](DataLoader::iter) cannot
-    /// decide the pass is over and spawn competing sets of workers at the same
-    /// time as another.
     stream: Arc<Mutex<Option<Stream<Vec<R>>>>>,
     marker: PhantomData<fn() -> (R, O)>,
 }
@@ -261,11 +257,9 @@ where
         tx: Sender<Vec<R>>,
     ) -> Result<()> {
         let mut rng = StdRng::seed_from_u64(seed);
-        // Raw bytes read from the decoder but not yet decoded.
         let mut buffer = vec![0u8; window_size * R::MAX_SIZE];
         let mut filled = 0usize;
-        // Decoded records waiting to be shuffled and cut into batches.
-        let mut window: Vec<R> = Vec::with_capacity(window_size + batch_size);
+        let mut carry = Vec::<R>::new();
 
         loop {
             let shard = shards
@@ -282,35 +276,29 @@ where
                 let read = read_chunk(&mut decoder, &mut buffer[filled..])
                     .with_context(|| format!("failed to read {name}"))?;
                 filled += read;
-                // Decode only what fits the window, so the batch queue keeps
-                // moving while a large read is worked through.
-                let max = window_size.saturating_sub(window.len()).max(1);
-                let (records, used) = R::read_from_bytes(&buffer[..filled], max)
-                    .map_err(|error| anyhow!("{error}"))
-                    .with_context(|| format!("failed to decode {name}"))?;
-                if used == 0 && read != 0 {
-                    bail!("a record in {name} exceeds the maximum record size");
-                }
-                buffer.copy_within(used..filled, 0);
-                filled -= used;
-                window.extend(records);
 
-                if window.len() >= window_size {
-                    window.shuffle(&mut rng);
-                    while window.len() >= batch_size {
-                        let batch = window.split_off(window.len() - batch_size);
-                        if tx.send(batch).is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-
-                // A short read is the end of the shard. Any bytes left in
-                // `filled` belong to the next one: shards splice into a single
-                // byte stream, so a record may span the boundary.
                 if read < room {
                     break;
                 }
+
+                let (mut decoded, used) = R::read_from_bytes(&buffer[..filled], usize::MAX)
+                    .map_err(|error| anyhow!("{error}"))
+                    .with_context(|| format!("failed to decode {name}"))?;
+                if used == 0 && read != 0 {
+                    bail!("decode failure in {name}");
+                }
+                buffer.copy_within(used..filled, 0);
+                filled -= used;
+
+                decoded.extend(carry);
+                decoded.shuffle(&mut rng);
+                while decoded.len() >= batch_size {
+                    let batch = decoded.split_off(decoded.len() - batch_size);
+                    if tx.send(batch).is_err() {
+                        return Ok(());
+                    }
+                }
+                carry = decoded;
             }
         }
     }

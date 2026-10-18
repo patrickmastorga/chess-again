@@ -10,6 +10,23 @@ chess-again-dataset = { workspace = true }
 anyhow = { workspace = true }
 burn = { workspace = true, features = ["std", "train", "dataset", "tui"] }
 
+[[bin]]
+name = "v1_pretrain"
+path = "src/bin/v1_pretrain.rs"
+
+# DDP needs a collective-capable backend, so this binary does not exist unless
+# `cuda` is enabled. Autodiscovery is still on for `src/bin`.
+[[bin]]
+name = "v1_pretrain_ddp"
+path = "src/bin/v1_pretrain_ddp.rs"
+required-features = ["cuda"]
+
+# Smoke test for the CUDA backend, so a broken build is found before a run.
+[[bin]]
+name = "cuda_check"
+path = "src/bin/cuda_check.rs"
+required-features = ["cuda"]
+
 [features]
 default = []
 metal  = ["chess-again-network/metal"]

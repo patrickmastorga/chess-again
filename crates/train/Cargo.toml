@@ -27,6 +27,12 @@ name = "cuda_check"
 path = "src/bin/cuda_check.rs"
 required-features = ["cuda"]
 
+# Profiles the DDP pipeline across device counts.
+[[bin]]
+name = "v1_profile_ddp"
+path = "src/bin/v1_profile_ddp.rs"
+required-features = ["cuda"]
+
 [features]
 default = []
 metal  = ["chess-again-network/metal"]

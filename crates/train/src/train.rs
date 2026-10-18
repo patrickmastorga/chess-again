@@ -1,11 +1,13 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use burn::config::Config;
+use burn::data::dataloader::DataLoader;
 use burn::grad_clipping::GradientClippingConfig;
-use burn::lr_scheduler::module_lr_scheduler::ModuleLrScheduler;
+use burn::lr_scheduler::module_lr_scheduler::ModuleLrSchedulerConfig;
 use burn::lr_scheduler::{
     LrSchedulerConfig, cosine::CosineAnnealingLrSchedulerConfig, linear::LinearLrSchedulerConfig,
     sequential::SequentialLrSchedulerConfig,
@@ -21,7 +23,7 @@ use burn::train::{
     ExecutionStrategy, InferenceStep, ItemLazy, Learner, SupervisedTraining, TrainOutput, TrainStep,
 };
 use chess_again_dataset::{RecordRSM, StreamingLoader};
-use chess_again_network::{V1Config, V1Model, V1Output};
+use chess_again_network::{V1Config, V1Model, V1Output, model::V1_0_CONFIG};
 
 use crate::batcher::{V1Batch, V1Batcher};
 
@@ -128,8 +130,8 @@ impl TrainStep for V1TrainModel {
 #[derive(Config, Debug)]
 pub struct V1PretrainConfig {
     pub model: V1Config,
-    /// AdamW, which decouples weight decay from the gradient update.
     pub optimizer: AdamWConfig,
+    pub lr_scheduler: LrSchedulerConfig,
     #[config(default = "\"data/train\".to_string()")]
     pub train_dir: String,
     #[config(default = "\"data/validate\".to_string()")]
@@ -138,14 +140,10 @@ pub struct V1PretrainConfig {
     pub artifact_dir: String,
     #[config(default = 1)]
     pub epochs: usize,
-    /// Optimizer steps served per epoch. The loader caps epochs in batches, so
-    /// this is converted with `grad_accumulation` when the loaders are built.
     #[config(default = 4_883)]
     pub steps_per_epoch: u64,
     #[config(default = 512)]
     pub batch_size: usize,
-    /// Records per optimizer step is `batch_size * grad_accumulation`; the
-    /// loader still yields batches of `batch_size`.
     #[config(default = 1)]
     pub grad_accumulation: usize,
     #[config(default = 4)]
@@ -154,18 +152,6 @@ pub struct V1PretrainConfig {
     pub batch_workers: usize,
     #[config(default = 0)]
     pub seed: u64,
-    /// The learning rate the warmup ramps up to and the cosine decays from.
-    #[config(default = 5e-4)]
-    pub learning_rate: f64,
-    /// The learning rate at the first step of the warmup.
-    #[config(default = 1e-6)]
-    pub warmup_start_lr: f64,
-    /// The floor the cosine decays to.
-    #[config(default = 1e-5)]
-    pub min_learning_rate: f64,
-    /// How many optimizer steps the warmup lasts.
-    #[config(default = 1_000)]
-    pub warmup_steps: u64,
     pub resume_checkpoint: Option<usize>,
 }
 
@@ -179,41 +165,41 @@ pub fn v1_default_optimizer() -> AdamWConfig {
         .with_grad_clipping(Some(GradientClippingConfig::Norm(10.0)))
 }
 
-/// Builds the pretraining schedule: a linear warmup to `learning_rate`,
-/// followed by a cosine decay to `min_learning_rate`.
-///
-/// The cosine spans the run after warmup, so it reaches the floor on the last
-/// optimizer step.
-fn pretrain_lr_scheduler(config: &V1PretrainConfig, steps: usize) -> Result<ModuleLrScheduler> {
-    let warmup_steps = config.warmup_steps as usize;
-    if warmup_steps >= steps {
-        bail!("warmup of {warmup_steps} steps leaves no room to decay in a {steps}-step run");
+/// Builds the pretraining schedule: a linear warmup to `peak`, followed by a
+/// cosine decay to `floor` over the remaining `total_steps`.
+pub fn v1_pretrain_scheduler(
+    peak: f64,
+    floor: f64,
+    warmup_start: f64,
+    warmup_steps: u64,
+    total_steps: usize,
+) -> Result<LrSchedulerConfig> {
+    let warmup_steps = warmup_steps as usize;
+    if warmup_steps >= total_steps {
+        bail!("warmup of {warmup_steps} steps leaves no room to decay in a {total_steps}-step run");
     }
 
-    SequentialLrSchedulerConfig::new(
-        vec![
-            LrSchedulerConfig::Linear(LinearLrSchedulerConfig::new(
-                config.warmup_start_lr,
-                config.learning_rate,
-                warmup_steps,
-            )),
-            LrSchedulerConfig::Cosine(
-                CosineAnnealingLrSchedulerConfig::new(config.learning_rate, steps - warmup_steps)
-                    .with_min_lr(config.min_learning_rate),
-            ),
-        ],
-        vec![warmup_steps],
-    )
-    .init()
-    .map_err(|error| anyhow::anyhow!("invalid learning rate schedule: {error}"))
+    Ok(LrSchedulerConfig::Sequential(
+        SequentialLrSchedulerConfig::new(
+            vec![
+                LrSchedulerConfig::Linear(LinearLrSchedulerConfig::new(
+                    warmup_start,
+                    peak,
+                    warmup_steps,
+                )),
+                LrSchedulerConfig::Cosine(
+                    CosineAnnealingLrSchedulerConfig::new(peak, total_steps - warmup_steps)
+                        .with_min_lr(floor),
+                ),
+            ],
+            vec![warmup_steps],
+        ),
+    ))
 }
 
 /// Runs a V1 pretraining pass on `device`.
 ///
-/// `device` must carry autodiff: pass a device from
-/// `default_device().autodiff()`. The model is initialized here, and a
-/// parameter's autodiff registration is fixed when it is created, so Burn
-/// forcing autodiff on the device it trains with cannot repair it afterwards.
+/// `device` must carry autodiff
 pub fn pretrain_v1(config: V1PretrainConfig, device: Device) -> Result<()> {
     if !device.is_autodiff() {
         bail!("the training device must carry autodiff, e.g. default_device().autodiff()");
@@ -267,7 +253,9 @@ pub fn pretrain_v1(config: V1PretrainConfig, device: Device) -> Result<()> {
             )
         })?;
 
-    let lr_scheduler = pretrain_lr_scheduler(&config, total_steps)?;
+    let lr_scheduler = ModuleLrSchedulerConfig::new(config.lr_scheduler.clone())
+        .init()
+        .map_err(|error| anyhow!("invalid learning rate schedule: {error}"))?;
     eprintln!(
         "{} epochs of {} optimizer steps ({} batches of up to {} records)",
         config.epochs, config.steps_per_epoch, batches_per_epoch, config.batch_size,
@@ -279,15 +267,9 @@ pub fn pretrain_v1(config: V1PretrainConfig, device: Device) -> Result<()> {
         config.grad_accumulation,
         total_steps,
     );
-    eprintln!(
-        "lr {} -> {} over {} warmup steps, then {} -> {} over {} decay steps",
-        config.warmup_start_lr,
-        config.learning_rate,
-        config.warmup_steps,
-        config.learning_rate,
-        config.min_learning_rate,
-        total_steps.saturating_sub(config.warmup_steps as usize),
-    );
+    // The schedule is supplied by the caller, so print what it is rather than
+    // recomputing its shape here.
+    eprintln!("lr schedule: {:?}", config.lr_scheduler);
 
     let model = V1TrainModel::new(config.model.init(&device));
     let learner = Learner::new(model, config.optimizer.init(), lr_scheduler);
@@ -354,8 +336,6 @@ pub fn pretrain_v1_ddp(config: V1PretrainConfig, devices: &[Device]) -> Result<(
 
     // Each step consumes `grad_accumulation` batches on every device.
     let batches_per_epoch = config.steps_per_epoch * config.grad_accumulation as u64;
-    // The scheduler advances once per optimizer step, exactly as single-device.
-    let total_steps = (config.steps_per_epoch * config.epochs as u64) as usize;
 
     let train_loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
         &config.train_dir,
@@ -390,7 +370,9 @@ pub fn pretrain_v1_ddp(config: V1PretrainConfig, devices: &[Device]) -> Result<(
             )
         })?;
 
-    let lr_scheduler = pretrain_lr_scheduler(&config, total_steps)?;
+    let lr_scheduler = ModuleLrSchedulerConfig::new(config.lr_scheduler.clone())
+        .init()
+        .map_err(|error| anyhow!("invalid learning rate schedule: {error}"))?;
     eprintln!(
         "{} epochs of {} optimizer steps on {} devices ({} batches of {} records each per device)",
         config.epochs, config.steps_per_epoch, n_devices, batches_per_epoch, batch_size,
@@ -403,15 +385,9 @@ pub fn pretrain_v1_ddp(config: V1PretrainConfig, devices: &[Device]) -> Result<(
         config.grad_accumulation,
     );
 
-    // The model is initialized on `devices[0]`, which must therefore carry
-    // autodiff: a parameter's registration is fixed when it is created, so
-    // Burn forcing autodiff on the devices it trains with cannot repair it.
-    // The remaining devices may be plain.
     let model = V1TrainModel::new(config.model.init(&devices[0]));
     let learner = Learner::new(model, config.optimizer.init(), lr_scheduler);
 
-    // Each device sees a disjoint shard of the data, so averaging the gradients
-    // is the correct reduction.
     let strategy = ExecutionStrategy::ddp(
         devices.to_vec(),
         DistributedConfig {
@@ -441,15 +417,187 @@ pub fn pretrain_v1_ddp(config: V1PretrainConfig, devices: &[Device]) -> Result<(
     Ok(())
 }
 
+/// Profiles a short DDP run and reports whether the dataloader is the bottleneck.
+pub fn v1_profile_ddp(
+    devices: &[Device],
+    data_workers: usize,
+    batch_workers: usize,
+    batch_size: usize,
+    steps: u64,
+    data_dir: impl AsRef<Path>,
+) -> Result<ProfileReport> {
+    if devices.is_empty() {
+        bail!("profiling needs at least one device");
+    }
+    if steps == 0 {
+        bail!("profiling needs at least one step");
+    }
+    if batch_size == 0 {
+        bail!("profiling needs a batch size of at least one");
+    }
+    let data_dir = data_dir.as_ref();
+
+    let loader_secs = time_loader(
+        devices[0].clone(),
+        data_workers,
+        batch_workers,
+        batch_size,
+        steps,
+        data_dir,
+    )?;
+    let step_secs = time_steps_ddp(
+        devices,
+        data_workers,
+        batch_workers,
+        batch_size,
+        steps,
+        data_dir,
+    )?;
+
+    let report = ProfileReport {
+        devices: devices.len(),
+        steps,
+        data_workers,
+        batch_workers,
+        batch_size,
+        loader_secs,
+        step_secs,
+    };
+    report.print();
+    Ok(report)
+}
+
+/// The outcome of one profiling run.
+#[derive(Debug, Clone)]
+pub struct ProfileReport {
+    pub devices: usize,
+    pub steps: u64,
+    pub data_workers: usize,
+    pub batch_workers: usize,
+    pub batch_size: usize,
+    /// Seconds to iterate `steps` batches with no model, on one device.
+    pub loader_secs: f64,
+    /// Seconds for the real training loop to run `steps` optimizer steps.
+    pub step_secs: f64,
+}
+
+impl ProfileReport {
+    pub fn print(&self) {
+        assert!(self.step_secs > 0.0, "step_secs must be positive");
+        let share = self.loader_secs / self.step_secs;
+        eprintln!("--- profile ---");
+        eprintln!(
+            "devices {} | steps {} | batch {} | data workers {} | batch workers {}",
+            self.devices, self.steps, self.batch_size, self.data_workers, self.batch_workers
+        );
+        eprintln!(
+            "loader alone {:>8.2}s ({:.1} ms/batch)",
+            self.loader_secs,
+            self.loader_secs * 1000.0 / self.steps as f64
+        );
+        eprintln!(
+            "full steps  {:>8.2}s ({:.1} ms/step)",
+            self.step_secs,
+            self.step_secs * 1000.0 / self.steps as f64
+        );
+        eprintln!("loader share of step time: {share:.2}");
+        if share >= 1.0 {
+            eprintln!("verdict: dataloader bound - the loader is slower than training");
+        } else if share >= 0.7 {
+            eprintln!("verdict: likely dataloader bound - more workers may help");
+        } else {
+            eprintln!("verdict: device bound - the loader is not the limit");
+        }
+    }
+}
+
+/// Times iterating `steps` batches on one device, with no model in the way.
+///
+/// The loader is built exactly as [`pretrain_v1_ddp`] builds it, so the numbers
+/// describe the same pipeline.
+fn time_loader(
+    device: Device,
+    data_workers: usize,
+    batch_workers: usize,
+    batch_size: usize,
+    steps: u64,
+    data_dir: &Path,
+) -> Result<f64> {
+    let loader = StreamingLoader::<RecordRSM, _, V1Batch>::new(
+        data_dir,
+        V1Batcher,
+        batch_size,
+        data_workers,
+        batch_workers,
+        0,
+    )
+    .with_context(|| format!("failed to open dataset {}", data_dir.display()))?
+    .with_batches_per_epoch(steps as usize)
+    .to_device(&device);
+
+    let start = Instant::now();
+    let mut seen = 0u64;
+    for batch in loader.iter() {
+        let batch = batch.map_err(|error| anyhow!("dataloader failed: {error}"))?;
+        std::hint::black_box(batch.input.dims());
+        seen += 1;
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    if seen < steps {
+        bail!("loader produced {seen} of {steps} batches");
+    }
+    Ok(elapsed)
+}
+
+/// Times the real DDP training loop for one epoch of `steps` optimizer steps.
+///
+/// Uses a constant learning rate, so a run of a few dozen steps cannot fail on
+/// a warmup that needs more steps than the profile has.
+fn time_steps_ddp(
+    devices: &[Device],
+    data_workers: usize,
+    batch_workers: usize,
+    batch_size: usize,
+    steps: u64,
+    data_dir: &Path,
+) -> Result<f64> {
+    let config = V1PretrainConfig::new(
+        V1_0_CONFIG,
+        v1_default_optimizer(),
+        LrSchedulerConfig::Constant(5e-4),
+    )
+    .with_train_dir(data_dir.display().to_string())
+    .with_test_dir(data_dir.display().to_string())
+    .with_artifact_dir("artifacts/v1-profile".to_string())
+    .with_epochs(1)
+    .with_steps_per_epoch(steps)
+    .with_batch_size(batch_size)
+    .with_grad_accumulation(1)
+    .with_data_workers(data_workers)
+    .with_batch_workers(batch_workers)
+    .with_seed(0);
+
+    // A profile must not leave checkpoints behind.
+    let dir = Path::new(&config.artifact_dir);
+    if dir.exists() {
+        fs::remove_dir_all(dir).with_context(|| format!("failed to clear {}", dir.display()))?;
+    }
+
+    let start = Instant::now();
+    pretrain_v1_ddp(config.clone(), devices)?;
+    Ok(start.elapsed().as_secs_f64())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::data::dataloader::batcher::Batcher;
+
     use chess_again_core::{Board, GameResult, Move};
     use chess_again_dataset::RecordRSM;
     use chess_again_network::{default_device, model::V1_0_CONFIG};
 
     use crate::V1Batcher;
+    use burn::data::dataloader::batcher::Batcher;
 
     #[test]
     fn synced_loss_feeds_the_loss_metric() {

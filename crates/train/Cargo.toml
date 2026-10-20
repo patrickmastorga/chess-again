@@ -11,26 +11,13 @@ anyhow = { workspace = true }
 burn = { workspace = true, features = ["std", "train", "dataset", "tui"] }
 
 [[bin]]
-name = "v1_pretrain"
-path = "src/bin/v1_pretrain.rs"
+name = "v1_2m_pretrain"
+path = "src/bin/v1_2M_pretrain.rs"
 
-# DDP needs a collective-capable backend, so this binary does not exist unless
-# `cuda` is enabled. Autodiscovery is still on for `src/bin`.
+# Run on Cluster with CUDA
 [[bin]]
-name = "v1_pretrain_ddp"
-path = "src/bin/v1_pretrain_ddp.rs"
-required-features = ["cuda"]
-
-# Smoke test for the CUDA backend, so a broken build is found before a run.
-[[bin]]
-name = "cuda_check"
-path = "src/bin/cuda_check.rs"
-required-features = ["cuda"]
-
-# Profiles the DDP pipeline across device counts.
-[[bin]]
-name = "v1_profile_ddp"
-path = "src/bin/v1_profile_ddp.rs"
+name = "v1_20M_pretrain"
+path = "src/bin/v1_20M_pretrain.rs"
 required-features = ["cuda"]
 
 [features]

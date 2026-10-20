@@ -3,7 +3,7 @@ use burn::tensor::{Bool, Device, Int, Tensor, TensorData};
 
 use chess_again_core::{Board, Color};
 use chess_again_dataset::{N_MOVE_INDICES, RECORD_RSM_SIZE, RecordRSM, encode_move};
-use chess_again_network::model::N_POLICY_CLASSES;
+use chess_again_network::N_POLICY_CLASSES;
 
 const N_SQUARES: usize = 64;
 const N_INPUT_FEATURES: usize = 20;

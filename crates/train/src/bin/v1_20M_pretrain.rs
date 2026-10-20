@@ -14,7 +14,7 @@ const BATCH_SIZE: usize = 2_048;
 const STREAM_WORKERS: usize = 4;
 const BATCH_WORKERS: usize = 2;
 
-// use chess_again_train::time_loader;
+use chess_again_train::time_loader;
 
 /// Times the loader alone for one epoch of batches, with no model involved.
 #[allow(dead_code)]
@@ -51,7 +51,7 @@ fn config() -> V1PretrainConfig {
         .with_train_dir("data/train".to_string())
         .with_test_dir("data/validate".to_string())
         .with_artifact_dir("artifacts/v1_20M_pretrain".to_string())
-        .with_epochs(EPOCHS)
+        .with_epochs(1)
         .with_steps_per_epoch(STEPS_PER_EPOCH)
         .with_batch_size(BATCH_SIZE)
         .with_stream_workers(STREAM_WORKERS)
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     let available = Device::enumerate(DeviceType::Cuda).autodiff().into_vec();
     eprintln!("{} CUDA device(s) found:", available.len());
     if available.is_empty() {
-        anyhow::bail!("no CUDA devices found; check the allocation and CUDA driver");
+        bail!("no CUDA devices found; check the allocation and CUDA driver");
     }
     for (index, device) in available.iter().enumerate() {
         eprintln!("  {index}: {device:?}");
@@ -82,6 +82,6 @@ fn main() -> Result<()> {
         BATCH_SIZE / device_count
     );
 
-    // run_loader_profile()?;
+    run_loader_profile()?;
     pretrain_v1(config(), devices)
 }

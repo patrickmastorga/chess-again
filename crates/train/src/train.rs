@@ -10,8 +10,6 @@ use burn::lr_scheduler::{
 use burn::module::Module;
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::optim::AdamWConfig;
-#[cfg(feature = "cuda")]
-use burn::tensor::DispatchDevice;
 use burn::tensor::ExecutionError;
 #[cfg(feature = "cuda")]
 use burn::tensor::distributed::{DistributedConfig, ReduceOperation};
@@ -226,9 +224,6 @@ pub fn pretrain_v1(config: V1PretrainConfig, devices: Vec<Device>) -> Result<()>
         bail!("multi-device training requires building with the `cuda` feature");
         #[cfg(feature = "cuda")]
         {
-            if devices.iter().any(|device| !is_cuda_device(device)) {
-                bail!("multi-device training currently supports only CUDA devices");
-            }
             config.batch_size / n_devices
         }
     };
@@ -332,18 +327,6 @@ pub fn pretrain_v1(config: V1PretrainConfig, devices: Vec<Device>) -> Result<()>
     }
 
     Ok(())
-}
-
-#[cfg(feature = "cuda")]
-fn is_cuda_device(device: &Device) -> bool {
-    let device = match device.as_dispatch() {
-        DispatchDevice::Autodiff(device) => &device.inner,
-        device => device,
-    };
-    matches!(
-        device,
-        DispatchDevice::Cube(burn::tensor::CubeDevice::Cuda(_))
-    )
 }
 
 /// Times iterating `steps` batches on one device, with no model in the way.

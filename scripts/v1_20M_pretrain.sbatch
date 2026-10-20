@@ -6,7 +6,7 @@
 
 # Request any device count from 1 to 4 GPUs. Slurm picks the count with the
 # best chance of starting soon, and the training binary uses whatever it gets.
-#SBATCH --gres=gpu:1-4
+#SBATCH --gres=gpu:2
 
 # -C HX00 matches H100 or H200; the alternation widens the pool to the other
 # Nvidia types that are reasonable here. Everything listed has well over the
@@ -17,7 +17,7 @@
 # cannot host a 1-4 GPU request at that size. This model needs a few GB per
 # GPU, so 32GB keeps every class in the constraint schedulable.
 #SBATCH --mem-per-gpu=32GB
-#SBATCH -t16:00:00
+#SBATCH -t8:00:00
 #SBATCH -ov1-20M-%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=pastorga3@gatech.edu

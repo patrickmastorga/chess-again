@@ -11,7 +11,7 @@ anyhow = { workspace = true }
 burn = { workspace = true, features = ["std", "train", "dataset", "tui"] }
 
 [[bin]]
-name = "v1_2m_pretrain"
+name = "v1_2M_pretrain"
 path = "src/bin/v1_2M_pretrain.rs"
 
 # Run on Cluster with CUDA

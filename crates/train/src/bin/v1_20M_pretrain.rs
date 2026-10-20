@@ -41,6 +41,20 @@ fn run_loader_profile() -> Result<()> {
     Ok(())
 }
 
+/// Trains one epoch on a single device, to prove it fits before DDP runs.
+#[allow(dead_code)]
+fn run_single_device_test() -> Result<()> {
+    let device = Device::enumerate(DeviceType::Cuda)
+        .autodiff()
+        .into_vec()
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no CUDA devices found"))?;
+
+    eprintln!("--- single-device test: one epoch on one device ---");
+    pretrain_v1(config().with_epochs(1), vec![device])
+}
+
 fn config() -> V1PretrainConfig {
     let total_steps = (STEPS_PER_EPOCH * EPOCHS as u64) as usize;
     let warmup_steps = (total_steps as f64 * 0.02) as u64;
@@ -51,7 +65,7 @@ fn config() -> V1PretrainConfig {
         .with_train_dir("data/train".to_string())
         .with_test_dir("data/validate".to_string())
         .with_artifact_dir("artifacts/v1_20M_pretrain".to_string())
-        .with_epochs(1)
+        .with_epochs(EPOCHS)
         .with_steps_per_epoch(STEPS_PER_EPOCH)
         .with_batch_size(BATCH_SIZE)
         .with_stream_workers(STREAM_WORKERS)
@@ -83,5 +97,6 @@ fn main() -> Result<()> {
     );
 
     run_loader_profile()?;
+    run_single_device_test()?;
     pretrain_v1(config(), devices)
 }

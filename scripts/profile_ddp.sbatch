@@ -3,12 +3,13 @@
 #SBATCH -N1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:H100:8
-#SBATCH -C H100
+#SBATCH --gres=gpu:8
+#SBATCH -C HX00
 #SBATCH --mem-per-gpu=224GB
 #SBATCH -t1:00:00
 #SBATCH -oprofile-%j.out
 #SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=pastorga3@gatech.edu
 
 # -e: stop at the first failure. -u: an unset variable is an error
 set -eu

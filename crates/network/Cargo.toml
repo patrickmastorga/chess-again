@@ -5,10 +5,10 @@ edition.workspace = true
 
 [dependencies]
 chess-again-core = { workspace = true }
-burn = { workspace = true, features = ["std", "flex", "fusion", "autotune"] }
+burn = { workspace = true, features = ["std", "flex"] }
 
 [features]
 default = []
-metal  = ["burn/metal"]
-cuda   = ["burn/cuda"]
-webgpu = ["burn/webgpu"]
+metal  = ["burn/metal", "burn/fusion", "burn/autotune"]
+cuda   = ["burn/cuda", "burn/fusion", "burn/autotune"]
+webgpu = ["burn/webgpu", "burn/fusion", "burn/autotune"]

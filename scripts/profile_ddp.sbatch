@@ -3,17 +3,8 @@
 #SBATCH -N1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
-# --gres asks for 8 GPUs of any type; -C HX00 narrows to H100 or H200, both
-# 8-GPU SXM5 nodes. HX00 roughly doubles the matching node pool over H100
-# alone, and 80GB vs 142GB does not matter at this model size.
 #SBATCH --gres=gpu:8
 #SBATCH -C HX00
-# PACE's recommendation for HGX nodes: the per-GPU share of the node's 2048GB,
-# so 8 GPUs claims the whole machine's memory. The default would be 1GB/core.
-=======
-#SBATCH --gres=gpu:8
-#SBATCH -C HX00
->>>>>>> 07852523f4cdf758cc5217052c47261d94548f26
 #SBATCH --mem-per-gpu=224GB
 #SBATCH -t1:00:00
 #SBATCH -oprofile-%j.out

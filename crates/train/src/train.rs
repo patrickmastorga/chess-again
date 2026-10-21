@@ -42,6 +42,27 @@ impl V1TrainModel {
     }
 }
 
+/// Weight applied to the WDL term of the combined loss.
+const WDL_LOSS_WEIGHT: f32 = 0.1;
+
+/// Computes the masked policy loss, the WDL loss and their weighted sum.
+///
+/// Shared by training and validation so the two cannot report different losses.
+fn v1_losses(model: &V1Model, item: &V1Batch) -> (Tensor<1>, Tensor<1>, Tensor<1>) {
+    let device = item.input.device();
+    let output = model.forward(item.input.clone());
+    // The policy head already predicts the flattened 4096 + 256 vector, so
+    // it can be masked and scored against the targets directly.
+    let policy_logits = output
+        .policy_logits
+        .mask_fill(item.policy_illegal_mask.clone(), f32::NEG_INFINITY);
+    let cross_entropy = CrossEntropyLossConfig::new().init(&device);
+    let policy_loss = cross_entropy.forward(policy_logits, item.policy_targets.clone());
+    let wdl_loss = cross_entropy.forward(output.wdl_logits, item.wdl_targets.clone());
+    let loss = policy_loss.clone() + wdl_loss.clone().mul_scalar(WDL_LOSS_WEIGHT);
+    (loss, policy_loss, wdl_loss)
+}
+
 pub struct V1TrainOutput {
     pub output: V1Output,
     /// Total loss, the one reported to the metric system.
@@ -52,12 +73,22 @@ pub struct V1TrainOutput {
 
 pub struct V1InferenceOutput {
     pub output: V1Output,
+    /// Validation loss, reported to the metric system for the valid split.
+    pub loss: Tensor<1>,
+    pub policy_loss: Tensor<1>,
+    pub wdl_loss: Tensor<1>,
 }
 
 impl ItemLazy for V1InferenceOutput {
     fn sync(self) -> Result<Self, ExecutionError> {
-        self.output.policy_logits.device().flush()?;
-        Ok(self)
+        self.loss.device().flush()?;
+
+        Ok(V1InferenceOutput {
+            output: self.output,
+            loss: self.loss.without_autodiff(),
+            policy_loss: self.policy_loss.without_autodiff(),
+            wdl_loss: self.wdl_loss.without_autodiff(),
+        })
     }
 }
 
@@ -80,13 +111,26 @@ impl Adaptor<LossInput> for V1TrainOutput {
     }
 }
 
+impl Adaptor<LossInput> for V1InferenceOutput {
+    fn adapt(&self) -> LossInput {
+        LossInput::new(self.loss.clone())
+    }
+}
+
 impl InferenceStep for V1TrainModel {
     type Input = V1Batch;
     type Output = V1InferenceOutput;
 
     fn step(&self, item: Self::Input) -> Self::Output {
+        let output = self.model.forward(item.input.clone());
+        // No backward here: the losses are computed only to be reported.
+        let (loss, policy_loss, wdl_loss) = v1_losses(&self.model, &item);
+
         V1InferenceOutput {
-            output: self.model.forward(item.input),
+            output,
+            loss,
+            policy_loss,
+            wdl_loss,
         }
     }
 }
@@ -96,18 +140,8 @@ impl TrainStep for V1TrainModel {
     type Output = V1TrainOutput;
 
     fn step(&self, item: Self::Input) -> TrainOutput<Self::Output> {
-        let device = item.input.device();
-        let output = self.model.forward(item.input);
-        // The policy head already predicts the flattened 4096 + 256 vector, so
-        // it can be masked and scored against the targets directly.
-        let policy_logits = output
-            .policy_logits
-            .clone()
-            .mask_fill(item.policy_illegal_mask, f32::NEG_INFINITY);
-        let cross_entropy = CrossEntropyLossConfig::new().init(&device);
-        let policy_loss = cross_entropy.forward(policy_logits, item.policy_targets);
-        let wdl_loss = cross_entropy.forward(output.wdl_logits.clone(), item.wdl_targets);
-        let loss = policy_loss.clone() + wdl_loss.clone().mul_scalar(0.1);
+        let output = self.model.forward(item.input.clone());
+        let (loss, policy_loss, wdl_loss) = v1_losses(&self.model, &item);
         let grads = loss.clone().backward();
 
         TrainOutput::new(
@@ -256,7 +290,8 @@ pub fn pretrain_v1(config: V1PretrainConfig, devices: Vec<Device>) -> Result<()>
         config.batch_workers,
         config.seed,
     )
-    .with_context(|| format!("failed to open test dataset {}", config.test_dir))?;
+    .with_context(|| format!("failed to open test dataset {}", config.test_dir))?
+    .with_batches_per_epoch(config.steps_per_epoch as usize);
 
     let artifact_dir = Path::new(&config.artifact_dir);
     config
@@ -282,9 +317,6 @@ pub fn pretrain_v1(config: V1PretrainConfig, devices: Vec<Device>) -> Result<()>
         n_devices,
         config.grad_accumulation,
     );
-    // The schedule is supplied by the caller, so print what it is rather than
-    // recomputing its shape here.
-    eprintln!("lr schedule: {:?}", config.lr_scheduler);
 
     let model = V1TrainModel::new(config.model.init(&devices[0]));
     let learner = Learner::new(model, config.optimizer.init(), lr_scheduler);
@@ -306,6 +338,7 @@ pub fn pretrain_v1(config: V1PretrainConfig, devices: Vec<Device>) -> Result<()>
         SupervisedTraining::new(artifact_dir, Arc::new(train_loader), Arc::new(test_loader))
             .num_epochs(config.epochs)
             .metric_train_numeric(LossMetric::new())
+            .metric_valid_numeric(LossMetric::new())
             .metric_train_numeric(LearningRateMetric::new())
             .with_default_checkpointers();
     #[cfg(feature = "cuda")]
@@ -561,5 +594,65 @@ mod tests {
         assert_eq!(output.loss.dims(), [1]);
         assert_eq!(output.policy_loss.dims(), [1]);
         assert_eq!(output.wdl_loss.dims(), [1]);
+    }
+
+    /// The validation split needs its own loss and adaptor, or the valid curve
+    /// never appears; `Adaptor<()> for T` lets that omission compile.
+    #[test]
+    fn inference_step_reports_a_loss_for_the_valid_split() {
+        use burn::train::metric::{Adaptor, LossInput, Metric, MetricMetadata};
+
+        let board = Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1")
+            .expect("test position should be valid");
+        let mv = Move::from_san("e5", &board).expect("e5 should be legal");
+        let record = RecordRSM::from_board(&board, mv.into(), GameResult::WhiteWin);
+        let device = default_device().autodiff();
+        let batch = V1Batcher.batch(vec![record], &device);
+        let model = V1TrainModel::new(V1_2M_CONFIG.init(&device));
+
+        let output = InferenceStep::step(&model, batch);
+        let synced = output.sync().expect("sync should succeed on flex");
+
+        assert_eq!(synced.loss.dims(), [1]);
+        assert_eq!(synced.policy_loss.dims(), [1]);
+        assert_eq!(synced.wdl_loss.dims(), [1]);
+
+        // The valid metric must read a real value, not a placeholder.
+        let input: LossInput = synced.adapt();
+        let mut metric = burn::train::metric::LossMetric::new();
+        let metadata = MetricMetadata {
+            progress: burn::data::dataloader::Progress::new(1, 1, None),
+            iteration: Some(1),
+            lr: None,
+        };
+        let entry = metric
+            .update(&input, &metadata)
+            .expect("loss metric reads the synced validation loss");
+        assert!(
+            entry.formatted.chars().any(|c| c.is_ascii_digit()),
+            "expected a numeric validation loss, got {}",
+            entry.formatted
+        );
+    }
+
+    /// Both steps must score the same way, since they share `v1_losses`.
+    #[test]
+    fn train_and_inference_agree_on_the_loss() {
+        let board = Board::starting();
+        let mv = Move::from_san("e4", &board).expect("e4 should be legal");
+        let record = RecordRSM::from_board(&board, mv.into(), GameResult::Draw);
+        let device = default_device().autodiff();
+        let batch = V1Batcher.batch(vec![record], &device);
+        let model = V1TrainModel::new(V1_2M_CONFIG.init(&device));
+
+        let train_loss = TrainStep::step(&model, batch.clone()).item.loss;
+        let valid_loss = InferenceStep::step(&model, batch).loss;
+
+        let train_loss = train_loss.to_data().try_to_vec::<f32>().unwrap()[0];
+        let valid_loss = valid_loss.to_data().try_to_vec::<f32>().unwrap()[0];
+        assert!(
+            (train_loss - valid_loss).abs() < 1e-6,
+            "train loss {train_loss} and validation loss {valid_loss} should match"
+        );
     }
 }

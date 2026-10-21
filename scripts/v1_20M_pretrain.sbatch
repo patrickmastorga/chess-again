@@ -2,7 +2,7 @@
 #SBATCH -J v1-20M-pretrain
 #SBATCH -N1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16
 
 # Request any device count from 1 to 4 GPUs. Slurm picks the count with the
 # best chance of starting soon, and the training binary uses whatever it gets.

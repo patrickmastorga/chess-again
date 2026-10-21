@@ -11,49 +11,8 @@ const STEPS_PER_EPOCH: u64 = 2_048;
 const EPOCHS: usize = 64;
 const BATCH_SIZE: usize = 2_048;
 
-const STREAM_WORKERS: usize = 4;
-const BATCH_WORKERS: usize = 2;
-
-use chess_again_train::time_loader;
-
-/// Times the loader alone for one epoch of batches, with no model involved.
-#[allow(dead_code)]
-fn run_loader_profile() -> Result<()> {
-    let device = Device::enumerate(DeviceType::Cuda)
-        .autodiff()
-        .into_vec()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no CUDA devices found"))?;
-
-    let seconds = time_loader(
-        device,
-        STREAM_WORKERS,
-        BATCH_WORKERS,
-        BATCH_SIZE,
-        STEPS_PER_EPOCH,
-        std::path::Path::new("data/train"),
-    )?;
-    eprintln!(
-        "loader: {seconds:.2}s for {STEPS_PER_EPOCH} batches of {BATCH_SIZE} ({:.1} ms/batch)",
-        seconds * 1000.0 / STEPS_PER_EPOCH as f64
-    );
-    Ok(())
-}
-
-/// Trains one epoch on a single device, to prove it fits before DDP runs.
-#[allow(dead_code)]
-fn run_single_device_test() -> Result<()> {
-    let device = Device::enumerate(DeviceType::Cuda)
-        .autodiff()
-        .into_vec()
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("no CUDA devices found"))?;
-
-    eprintln!("--- single-device test: one epoch on one device ---");
-    pretrain_v1(config().with_epochs(1), vec![device])
-}
+const STREAM_WORKERS: usize = 2;
+const BATCH_WORKERS: usize = 1;
 
 fn config() -> V1PretrainConfig {
     let total_steps = (STEPS_PER_EPOCH * EPOCHS as u64) as usize;
@@ -82,9 +41,6 @@ fn main() -> Result<()> {
         eprintln!("  {index}: {device:?}");
     }
 
-    // DDP runs the same number of batches on every device, so train on the
-    // most devices that still divide the batch evenly. With 8 devices and a
-    // batch of 2048 that is all 8; on a 4-GPU allocation it is 4.
     let device_count = (1..=available.len())
         .rev()
         .find(|count| BATCH_SIZE.is_multiple_of(*count))
@@ -96,7 +52,5 @@ fn main() -> Result<()> {
         BATCH_SIZE / device_count
     );
 
-    run_loader_profile()?;
-    run_single_device_test()?;
     pretrain_v1(config(), devices)
 }

@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -61,15 +61,19 @@ struct Stream<T> {
     /// Receiver for the stream of items, always held so that the stream remains connected.
     rx: Receiver<T>,
     workers: Vec<JoinHandle<Result<()>>>,
+    /// Set when the pass is over, so producers stop instead of parking on a
+    /// full queue. Crossbeam offers no sender-side disconnect check.
+    done: Arc<AtomicBool>,
 }
 
 impl<T> Stream<T> {
     /// Disconnects the item queue and waits for the producing threads,
     /// returning the first failure among them.
     fn shutdown(self) -> Result<()> {
-        let Self { rx, workers } = self;
-        // Drop the receiver first to immediately disconnect the item queue,
-        // otherwise a worker parked in `send` on a full queue never returns.
+        let Self { rx, workers, done } = self;
+        // Tell the producers to stop before dropping the receiver: a worker
+        // parked in `send` on a full queue would otherwise never return.
+        done.store(true, Ordering::Relaxed);
         drop(rx);
         // Next join all the workers
         let mut failure = None;
@@ -225,6 +229,7 @@ where
         )));
 
         let (tx, rx) = bounded::<Vec<R>>(BATCH_QUEUE);
+        let done = Arc::new(AtomicBool::new(false));
 
         let mut workers = Vec::with_capacity(self.stream_workers);
         for index in 0..self.stream_workers {
@@ -232,19 +237,20 @@ where
             let window_size = self.window_size;
             let batch_size = self.batch_size;
             let worker_seed = self.seed ^ index as u64;
+            let done = Arc::clone(&done);
             let tx = tx.clone();
             workers.push(
                 thread::Builder::new()
                     .name(format!("dataloader-stream-worker-{index}"))
                     .spawn(move || {
-                        Self::stream_worker(shards, window_size, batch_size, worker_seed, tx)
+                        Self::stream_worker(shards, window_size, batch_size, worker_seed, tx, done)
                     })?,
             );
         }
         // The workers should hold sender for proper exit behavior.
         drop(tx);
 
-        Ok(Stream { rx, workers })
+        Ok(Stream { rx, workers, done })
     }
 
     /// Decodes records from the shards and sends them as unbatched groups of
@@ -255,6 +261,7 @@ where
         batch_size: usize,
         seed: u64,
         tx: Sender<Vec<R>>,
+        done: Arc<AtomicBool>,
     ) -> Result<()> {
         let mut rng = StdRng::seed_from_u64(seed);
         let mut buffer = vec![0u8; window_size * R::MAX_SIZE];
@@ -262,6 +269,13 @@ where
         let mut carry = Vec::<R>::new();
 
         loop {
+            // A pass ends when the consumer is finished with it. Without this
+            // the worker parks forever in `send` on a full queue, because the
+            // shard order recycles and the decode loop alone never ends.
+            if done.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
             let shard = shards
                 .lock()
                 .expect("shards is never poisoned!")
@@ -294,7 +308,10 @@ where
                 decoded.shuffle(&mut rng);
                 while decoded.len() >= batch_size {
                     let batch = decoded.split_off(decoded.len() - batch_size);
-                    if tx.send(batch).is_err() {
+                    // Also check before sending, so a worker notices a
+                    // finished pass as soon as the queue drains rather than
+                    // after the next batch is produced.
+                    if done.load(Ordering::Relaxed) || tx.send(batch).is_err() {
                         return Ok(());
                     }
                 }
@@ -313,15 +330,26 @@ where
         claimed: Arc<AtomicUsize>,
         quota: usize,
     ) -> Result<()> {
-        while claimed.fetch_add(1, Ordering::Relaxed) < quota {
+        loop {
+            if claimed.load(Ordering::Relaxed) >= quota {
+                return Ok(());
+            }
             let Ok(records) = rx.recv() else {
                 return Ok(());
             };
+            // Claim only once there is an item to turn into a batch. Claiming
+            // before the check would both overshoot the quota by one per
+            // worker and consume an item that never becomes a batch, which
+            // starves the stream of the items its consumers are waiting for.
+            let ticket = claimed.fetch_add(1, Ordering::Relaxed);
+            if ticket >= quota {
+                claimed.fetch_sub(1, Ordering::Relaxed);
+                return Ok(());
+            }
             if tx.send(batcher.batch(records, &device)).is_err() {
                 return Ok(());
             }
         }
-        Ok(())
     }
 
     /// A handle onto the same stream with its own quota and device.

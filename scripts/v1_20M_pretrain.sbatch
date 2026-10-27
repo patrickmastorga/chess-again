@@ -27,6 +27,8 @@ set -eu
 
 cd "$SLURM_SUBMIT_DIR"
 
+module load nvhpc-nccl/25.5
+
 echo "=== job $SLURM_JOB_ID on $(hostname) ==="
 date
 echo "granted GPUs: ${SLURM_GPUS_ON_NODE:-unknown}"
@@ -34,17 +36,7 @@ echo "granted GPUs: ${SLURM_GPUS_ON_NODE:-unknown}"
 nvidia-smi -L
 echo
 
-# Fail early and clearly if the build is missing
-BIN=target/release/v1_20M_pretrain
-if [[ ! -x $BIN ]]; then
-    echo "missing $BIN: build it first with" >&2
-    echo "  cargo build --release --features cuda -p chess-again-train --bin v1_20M_pretrain" >&2
-    exit 1
-fi
-
-# The binary enumerates the allocated CUDA devices itself and trains on the
-# most of them that divide its batch size evenly.
-"$BIN"
+cargo run --release --features cuda -p chess-again-train --bin v1_20M_pretrain
 
 echo
 echo "=== done ==="
